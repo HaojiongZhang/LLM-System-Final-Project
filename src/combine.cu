@@ -472,7 +472,188 @@ __global__ void zipKernel(
 }
 
 
+__global__ void FlashAttention2BackwardKernel(
+    const float* dout,
+    const float* q,
+    const float* k,
+    const float* v,
+    const float* out,
+    const float* lse,
+    float* dq,
+    float* dk,
+    float* dv,
+    int B,
+    int H,
+    int T,
+    int D,
+    int causal,
+    float softmax_scale)
+{
+  // Logical input/output shapes:
+  // q,k,v,out,dout,dq,dk,dv: (B,H,T,D)
+  // lse:                     (B,H,T)
+  // This kernel maps one thread -> one attention pair (i,j) for fixed (b,h).
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = B * H * T * T;
+  if (idx >= total) {
+    return;
+  }
+
+  // Decode flattened index into tuple (b,h,i,j).
+  int j = idx % T;
+  int rem = idx / T;
+  int i = rem % T;
+  rem /= T;
+  int h = rem % H;
+  int b = rem / H;
+
+  // Causal mask rule: query i cannot attend to key j when j > i.
+  if (causal && j > i) {
+    return;
+  }
+
+  // Flat row/col offsets into compact (B,H,T,D) layout.
+  int row4 = ((b * H + h) * T + i) * D;
+  int col4 = ((b * H + h) * T + j) * D;
+  // Offset into compact (B,H,T) layout for row i.
+  int row3 = ((b * H + h) * T + i);
+
+  // score_ij = softmax_scale * dot(q_i, k_j)
+  float score = 0.0f;
+  for (int d = 0; d < D; ++d) {
+    score += q[row4 + d] * k[col4 + d];
+  }
+  score *= softmax_scale;
+
+  // p_ij = exp(score_ij - lse_i)
+  float p = expf(score - lse[row3]);
+
+  // dP_ij = dot(dO_i, V_j)
+  // D_i   = dot(dO_i, O_i)
+  // dS_ij = P_ij * (dP_ij - D_i)
+  float dP = 0.0f;
+  float Drow = 0.0f;
+  for (int d = 0; d < D; ++d) {
+    dP += dout[row4 + d] * v[col4 + d];
+    Drow += dout[row4 + d] * out[row4 + d];
+  }
+
+  float dS = p * (dP - Drow);
+
+  // Accumulate gradients:
+  // dV_j += P_ij * dO_i
+  // dQ_i += dS_ij * K_j * scale
+  // dK_j += dS_ij * Q_i * scale
+  // Multiple (i,j) pairs may update same row/col -> atomicAdd required.
+  for (int d = 0; d < D; ++d) {
+    atomicAdd(&dv[col4 + d], p * dout[row4 + d]);
+    atomicAdd(&dq[row4 + d], dS * k[col4 + d] * softmax_scale);
+    atomicAdd(&dk[col4 + d], dS * q[row4 + d] * softmax_scale);
+  }
+}
+
+
 extern "C" {
+
+void FlashAttention2Backward(
+    float* dout,
+    float* q,
+    float* k,
+    float* v,
+    float* out,
+    float* lse,
+    float* dq,
+    float* dk,
+    float* dv,
+    int B,
+    int H,
+    int T,
+    int D,
+    int causal,
+    float softmax_scale) {
+    // Host-side C ABI wrapper called from Python ctypes.
+    // Performs:
+    //   1) H2D copies,
+    //   2) kernel launch,
+    //   3) D2H copies,
+    //   4) cleanup.
+    size_t size4 = (size_t)B * H * T * D;
+    size_t size3 = (size_t)B * H * T;
+
+    float *d_dout, *d_q, *d_k, *d_v, *d_out, *d_lse;
+    float *d_dq, *d_dk, *d_dv;
+
+    // Device allocations for all inputs/outputs.
+    cudaMalloc(&d_dout, size4 * sizeof(float));
+    cudaMalloc(&d_q, size4 * sizeof(float));
+    cudaMalloc(&d_k, size4 * sizeof(float));
+    cudaMalloc(&d_v, size4 * sizeof(float));
+    cudaMalloc(&d_out, size4 * sizeof(float));
+    cudaMalloc(&d_lse, size3 * sizeof(float));
+    cudaMalloc(&d_dq, size4 * sizeof(float));
+    cudaMalloc(&d_dk, size4 * sizeof(float));
+    cudaMalloc(&d_dv, size4 * sizeof(float));
+
+    // Copy host tensors to device.
+    cudaMemcpy(d_dout, dout, size4 * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_q, q, size4 * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_k, k, size4 * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_v, v, size4 * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_out, out, size4 * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_lse, lse, size3 * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Zero output gradient buffers before atomic accumulation in kernel.
+    cudaMemset(d_dq, 0, size4 * sizeof(float));
+    cudaMemset(d_dk, 0, size4 * sizeof(float));
+    cudaMemset(d_dv, 0, size4 * sizeof(float));
+
+    // One thread per (b,h,i,j) pair.
+    int total = B * H * T * T;
+    int threadsPerBlock = 256;
+    int blocksPerGrid = (total + threadsPerBlock - 1) / threadsPerBlock;
+
+    FlashAttention2BackwardKernel<<<blocksPerGrid, threadsPerBlock>>>(
+        d_dout,
+        d_q,
+        d_k,
+        d_v,
+        d_out,
+        d_lse,
+        d_dq,
+        d_dk,
+        d_dv,
+        B,
+        H,
+        T,
+        D,
+        causal,
+        softmax_scale);
+
+    // Synchronize so any launch/runtime errors become visible here.
+    cudaDeviceSynchronize();
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+      fprintf(stderr, "FlashAttention2Backward Error: %s\n", cudaGetErrorString(err));
+      exit(EXIT_FAILURE);
+    }
+
+    // Copy gradients back to host buffers expected by ctypes caller.
+    cudaMemcpy(dq, d_dq, size4 * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(dk, d_dk, size4 * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(dv, d_dv, size4 * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Release all temporary device allocations.
+    cudaFree(d_dout);
+    cudaFree(d_q);
+    cudaFree(d_k);
+    cudaFree(d_v);
+    cudaFree(d_out);
+    cudaFree(d_lse);
+    cudaFree(d_dq);
+    cudaFree(d_dk);
+    cudaFree(d_dv);
+}
 
 void MatrixMultiply(
     float* out,

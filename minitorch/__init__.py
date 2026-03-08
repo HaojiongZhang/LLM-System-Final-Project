@@ -24,6 +24,7 @@ from .tensor_data import *  # noqa: F401,F403
 from .tensor_functions import *  # noqa: F401,F403
 from .tensor_ops import *  # noqa: F401,F403
 from .testing import MathTest, MathTestVariable  # type: ignore # noqa: F401,F403
+from .flash_attention2 import *  # noqa: F401,F403
 
 # ASSIGNMENT 2
 from .transformer import *
