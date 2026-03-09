@@ -122,17 +122,22 @@ CUDA kernel implementation + C ABI wrapper.
 
 Key elements:
 - `FlashAttention2BackwardKernel(...)`
-  - one thread per attention pair `(b,h,i,j)`
-  - computes local score/probability
-  - computes `dS`
-  - atomically accumulates `dQ/dK/dV`
+  - one block per query row `(b,h,i)`
+  - key/value dimension processed in shared-memory tiles (`BK=16`)
+  - cooperative reductions inside block for:
+    - score dot product `dot(q_i, k_j)`
+    - `dP_ij = dot(dO_i, V_j)`
+    - row scalar `D_i = dot(dO_i, O_i)`
+  - `dQ` accumulated without atomics (row-private block ownership)
+  - `dK` / `dV` use atomic add only where cross-row write conflicts exist
 - `extern "C" void FlashAttention2Backward(...)`
   - entrypoint called by `ctypes`
   - alloc/copy/launch/copy-back/free
 
 Notes:
-- this is a correctness-first kernel
-- atomics are used due to many-to-one gradient accumulation
+- this implementation is now a practical tiled kernel (not a naive pairwise kernel)
+- shared memory is used to leverage locality and reduce global-memory traffic
+- selective atomics are kept only for unavoidable accumulation conflicts
 
 ---
 
@@ -214,7 +219,31 @@ Pipeline:
 
 ---
 
-## 8) Related docs
+## 8) Latest GPU validation (PSC)
+
+Latest validation job:
+- Job ID: `37923424`
+- State: `COMPLETED`
+- ExitCode: `0:0`
+- Log: `fa2_cuda_test_37923424.log`
+
+Observed outputs:
+- FA2 backward tests: `6 passed`
+- Explicit CUDA path check: success
+- Timing probe (single-run, includes Python + wrapper overhead):
+  - shape `(B=2,H=4,T=128,D=64)`
+  - `cuda_ms=2525.329`
+  - `ref_ms=2489.146`
+  - speedup ratio (`ref/cuda`) `= 0.99x`
+
+Interpretation:
+- kernel is now tiled and hardware-aware,
+- but end-to-end runtime is still dominated by host-device copy overhead and
+  remaining atomic accumulation on `dK/dV` in this wrapper path.
+
+---
+
+## 9) Related docs
 
 - `docs/FLASH_ATTENTION2_BACKWARD.md`
 - `docs/FLASH_ATTENTION2_BACKWARD_zh-TW.md`

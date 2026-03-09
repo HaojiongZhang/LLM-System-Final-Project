@@ -122,17 +122,22 @@ CUDA kernel 實作 + C ABI wrapper。
 
 關鍵元素：
 - `FlashAttention2BackwardKernel(...)`
-  - 每個 thread 負責一個 `(b,h,i,j)` attention pair
-  - 計算局部 score / probability
-  - 計算 `dS`
-  - 用 atomic 累積 `dQ/dK/dV`
+  - 每個 block 負責一個 query row `(b,h,i)`
+  - key/value 採 shared memory 分塊（`BK=16`）
+  - block 內合作 reduction 計算：
+    - `dot(q_i, k_j)`（score）
+    - `dP_ij = dot(dO_i, V_j)`
+    - `D_i = dot(dO_i, O_i)`
+  - `dQ` 由 row-private block 直接累積（不需要 atomic）
+  - `dK` / `dV` 僅在跨 row 寫入衝突處使用 atomic
 - `extern "C" void FlashAttention2Backward(...)`
   - 供 `ctypes` 呼叫的入口
   - alloc/copy/launch/copy-back/free
 
 備註：
-- 目前設計以正確性優先
-- 因為梯度會多對一累積，因此使用 atomic
+- 目前已是較實務的 tiled kernel（不再是單純 pairwise kernel）
+- 透過 shared memory 提升資料區域性並降低 global memory 流量
+- 僅保留必要的 atomic 以處理不可避免的累積衝突
 
 ---
 
@@ -214,7 +219,30 @@ PSC GPU 批次驗證腳本。
 
 ---
 
-## 8) 相關文件
+## 8) 最新 GPU 驗證結果（PSC）
+
+最新驗證工作：
+- Job ID：`37923424`
+- 狀態：`COMPLETED`
+- ExitCode：`0:0`
+- Log：`fa2_cuda_test_37923424.log`
+
+觀察結果：
+- FA2 backward 測試：`6 passed`
+- 額外 CUDA 路徑檢查：成功
+- 簡易時間量測（單次、含 Python/封裝層開銷）：
+  - shape `(B=2,H=4,T=128,D=64)`
+  - `cuda_ms=2525.329`
+  - `ref_ms=2489.146`
+  - 速度比（`ref/cuda`）`= 0.99x`
+
+解讀：
+- kernel 已改為 shared-memory tiled 的硬體導向實作，
+- 但端到端時間仍受 host-device copy 與 `dK/dV` 的 atomic 累積成本影響。
+
+---
+
+## 9) 相關文件
 
 - `docs/FLASH_ATTENTION2_BACKWARD.md`
 - `docs/FLASH_ATTENTION2_BACKWARD_zh-TW.md`

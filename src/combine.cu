@@ -489,66 +489,125 @@ __global__ void FlashAttention2BackwardKernel(
     int causal,
     float softmax_scale)
 {
-  // Logical input/output shapes:
-  // q,k,v,out,dout,dq,dk,dv: (B,H,T,D)
-  // lse:                     (B,H,T)
-  // This kernel maps one thread -> one attention pair (i,j) for fixed (b,h).
-  int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  int total = B * H * T * T;
-  if (idx >= total) {
+  // Practical FA2-style mapping:
+  // - one thread block handles one query row (b,h,i),
+  // - iterate keys in tiles loaded to shared memory,
+  // - avoid atomics for dQ row accumulation,
+  // - keep atomics only where cross-row conflicts are unavoidable (dK/dV).
+
+  int row = blockIdx.x;
+  int total_rows = B * H * T;
+  if (row >= total_rows) {
     return;
   }
 
-  // Decode flattened index into tuple (b,h,i,j).
-  int j = idx % T;
-  int rem = idx / T;
+  int tid = threadIdx.x;
+
+  // Decode flattened row index into (b,h,i).
+  int rem = row;
   int i = rem % T;
   rem /= T;
   int h = rem % H;
   int b = rem / H;
 
-  // Causal mask rule: query i cannot attend to key j when j > i.
-  if (causal && j > i) {
-    return;
-  }
-
-  // Flat row/col offsets into compact (B,H,T,D) layout.
+  // Flat row offsets into compact (B,H,T,D) and (B,H,T) layouts.
   int row4 = ((b * H + h) * T + i) * D;
-  int col4 = ((b * H + h) * T + j) * D;
-  // Offset into compact (B,H,T) layout for row i.
   int row3 = ((b * H + h) * T + i);
 
-  // score_ij = softmax_scale * dot(q_i, k_j)
-  float score = 0.0f;
-  for (int d = 0; d < D; ++d) {
-    score += q[row4 + d] * k[col4 + d];
+  // Tile size over key dimension and dynamic shared-memory layout.
+  const int BK = 16;
+  extern __shared__ float smem[];
+
+  float* q_sh = smem;                           // [D]
+  float* do_sh = q_sh + D;                      // [D]
+  float* k_sh = do_sh + D;                      // [BK * D]
+  float* v_sh = k_sh + BK * D;                  // [BK * D]
+  float* red1 = v_sh + BK * D;                  // [blockDim.x]
+  float* red2 = red1 + blockDim.x;              // [blockDim.x]
+
+  // Load q_i and dO_i once into shared memory.
+  for (int d = tid; d < D; d += blockDim.x) {
+    q_sh[d] = q[row4 + d];
+    do_sh[d] = dout[row4 + d];
   }
-  score *= softmax_scale;
+  __syncthreads();
 
-  // p_ij = exp(score_ij - lse_i)
-  float p = expf(score - lse[row3]);
-
-  // dP_ij = dot(dO_i, V_j)
-  // D_i   = dot(dO_i, O_i)
-  // dS_ij = P_ij * (dP_ij - D_i)
-  float dP = 0.0f;
-  float Drow = 0.0f;
-  for (int d = 0; d < D; ++d) {
-    dP += dout[row4 + d] * v[col4 + d];
-    Drow += dout[row4 + d] * out[row4 + d];
+  // D_i = dot(dO_i, O_i), computed once per row.
+  float part_D = 0.0f;
+  for (int d = tid; d < D; d += blockDim.x) {
+    part_D += do_sh[d] * out[row4 + d];
   }
+  red1[tid] = part_D;
+  __syncthreads();
+  for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
+    if (tid < offset) {
+      red1[tid] += red1[tid + offset];
+    }
+    __syncthreads();
+  }
+  float Drow = red1[0];
 
-  float dS = p * (dP - Drow);
+  // Walk over key/value tiles.
+  for (int k0 = 0; k0 < T; k0 += BK) {
+    int k_tile = min(BK, T - k0);
 
-  // Accumulate gradients:
-  // dV_j += P_ij * dO_i
-  // dQ_i += dS_ij * K_j * scale
-  // dK_j += dS_ij * Q_i * scale
-  // Multiple (i,j) pairs may update same row/col -> atomicAdd required.
-  for (int d = 0; d < D; ++d) {
-    atomicAdd(&dv[col4 + d], p * dout[row4 + d]);
-    atomicAdd(&dq[row4 + d], dS * k[col4 + d] * softmax_scale);
-    atomicAdd(&dk[col4 + d], dS * q[row4 + d] * softmax_scale);
+    // Load K and V tile to shared memory.
+    for (int linear = tid; linear < k_tile * D; linear += blockDim.x) {
+      int tj = linear / D;
+      int d = linear % D;
+      int col4 = ((b * H + h) * T + (k0 + tj)) * D;
+      k_sh[tj * D + d] = k[col4 + d];
+      v_sh[tj * D + d] = v[col4 + d];
+    }
+    __syncthreads();
+
+    for (int tj = 0; tj < k_tile; ++tj) {
+      int j = k0 + tj;
+      if (causal && j > i) {
+        continue;
+      }
+
+      // score_ij = scale * dot(q_i, k_j)
+      float part_score = 0.0f;
+      for (int d = tid; d < D; d += blockDim.x) {
+        part_score += q_sh[d] * k_sh[tj * D + d];
+      }
+      red1[tid] = part_score;
+
+      // dP_ij = dot(dO_i, V_j)
+      float part_dP = 0.0f;
+      for (int d = tid; d < D; d += blockDim.x) {
+        part_dP += do_sh[d] * v_sh[tj * D + d];
+      }
+      red2[tid] = part_dP;
+      __syncthreads();
+
+      // Reduce both scalars cooperatively.
+      for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
+        if (tid < offset) {
+          red1[tid] += red1[tid + offset];
+          red2[tid] += red2[tid + offset];
+        }
+        __syncthreads();
+      }
+
+      float score = red1[0] * softmax_scale;
+      float dP = red2[0];
+      float p = expf(score - lse[row3]);
+      float dS = p * (dP - Drow);
+
+      // Per-dimension updates.
+      // - dQ row is unique to this block -> no atomics needed.
+      // - dK/dV are shared across many rows -> atomicAdd required.
+      int col4 = ((b * H + h) * T + j) * D;
+      for (int d = tid; d < D; d += blockDim.x) {
+        dq[row4 + d] += dS * k_sh[tj * D + d] * softmax_scale;
+        atomicAdd(&dk[col4 + d], dS * q_sh[d] * softmax_scale);
+        atomicAdd(&dv[col4 + d], p * do_sh[d]);
+      }
+      __syncthreads();
+    }
+    __syncthreads();
   }
 }
 
@@ -607,12 +666,21 @@ void FlashAttention2Backward(
     cudaMemset(d_dk, 0, size4 * sizeof(float));
     cudaMemset(d_dv, 0, size4 * sizeof(float));
 
-    // One thread per (b,h,i,j) pair.
-    int total = B * H * T * T;
+    // One block per query row (b,h,i); each block iterates key tiles.
+    int total_rows = B * H * T;
     int threadsPerBlock = 256;
-    int blocksPerGrid = (total + threadsPerBlock - 1) / threadsPerBlock;
+    if (D < threadsPerBlock) {
+      // Keep a power-of-two-ish block size for reduction efficiency.
+      threadsPerBlock = 1;
+      while (threadsPerBlock < D && threadsPerBlock < 256) {
+        threadsPerBlock <<= 1;
+      }
+    }
+    int blocksPerGrid = total_rows;
+    const int BK = 16;
+    size_t sharedBytes = (size_t)(2 * D + 2 * BK * D + 2 * threadsPerBlock) * sizeof(float);
 
-    FlashAttention2BackwardKernel<<<blocksPerGrid, threadsPerBlock>>>(
+    FlashAttention2BackwardKernel<<<blocksPerGrid, threadsPerBlock, sharedBytes>>>(
         d_dout,
         d_q,
         d_k,
