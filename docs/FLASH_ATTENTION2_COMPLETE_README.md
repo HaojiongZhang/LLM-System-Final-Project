@@ -46,30 +46,28 @@ Where:
 
 ### Scaling
 - `softmax_scale` should match forward exactly.
-- default is $1/\sqrt{D}$ when unspecified.
+- default is `1 / sqrt(D)` when unspecified.
 
 ---
 
 ## 3) Math used in backward
 
-Let
-$$
-S = \text{scale} \cdot QK^T + \text{mask},\quad
-P = \text{softmax}(S),\quad
-O = PV
-$$
+For maximum compatibility across Markdown renderers (GitHub, IDE preview, docs sites),
+the equations are written in plain text:
 
-Given `dO`:
-$$
-\begin{aligned}
-dV &= P^T dO \\
-dP &= dO V^T \\
-D_i &= \langle dO_i, O_i \rangle \\
-dS &= P \odot (dP - D) \\
-dQ &= \text{scale} \cdot dS K \\
-dK &= \text{scale} \cdot dS^T Q
-\end{aligned}
-$$
+```text
+S = scale * (Q K^T) + mask
+P = softmax(S)
+O = P V
+
+Given dO:
+dV = P^T dO
+dP = dO V^T
+D_i = dot(dO_i, O_i)
+dS = P * (dP - D)
+dQ = scale * dS K
+dK = scale * dS^T Q
+```
 
 ---
 

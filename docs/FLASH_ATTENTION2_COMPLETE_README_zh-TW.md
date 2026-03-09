@@ -46,30 +46,28 @@
 
 ### scale
 - `softmax_scale` 必須與 forward 完全一致。
-- 未指定時預設為 $1/\sqrt{D}$。
+- 未指定時預設為 `1 / sqrt(D)`。
 
 ---
 
 ## 3) backward 使用數學
 
-令
-$$
-S = \text{scale} \cdot QK^T + \text{mask},\quad
-P = \text{softmax}(S),\quad
-O = PV
-$$
+為了在不同 Markdown 環境（GitHub、IDE 預覽、文件網站）都穩定顯示，
+這裡改用純文字公式：
 
-已知 `dO`：
-$$
-\begin{aligned}
-dV &= P^T dO \\
-dP &= dO V^T \\
-D_i &= \langle dO_i, O_i \rangle \\
-dS &= P \odot (dP - D) \\
-dQ &= \text{scale} \cdot dS K \\
-dK &= \text{scale} \cdot dS^T Q
-\end{aligned}
-$$
+```text
+S = scale * (Q K^T) + mask
+P = softmax(S)
+O = P V
+
+Given dO:
+dV = P^T dO
+dP = dO V^T
+D_i = dot(dO_i, O_i)
+dS = P * (dP - D)
+dQ = scale * dS K
+dK = scale * dS^T Q
+```
 
 ---
 
