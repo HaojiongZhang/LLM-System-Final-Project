@@ -533,6 +533,7 @@ __global__ void FlashAttention2BackwardKernel(
   float* Drow_sh = dv_acc + BK * D_PAD;                       // [BQ]
   float* p_sh = Drow_sh + BQ;                                 // [BQ]
   float* dS_sh = p_sh + BQ;                                   // [BQ]
+  float* lse_sh = dS_sh + BQ;                                 // [BQ]
 
   // Load this block's Q/dO/out tile once.
   for (int linear = tid; linear < q_tile * D; linear += blockDim.x) {
@@ -555,6 +556,13 @@ __global__ void FlashAttention2BackwardKernel(
 
   // Each warp owns one query row in the Q tile.
   if (warp_id < q_tile) {
+    int i = q0 + warp_id;
+
+    if (lane == 0) {
+      int row3 = ((b * H + h) * T + i);
+      lse_sh[warp_id] = lse[row3];
+    }
+
     // Warp-level D_i = dot(dO_i, O_i) reduction.
     float part_D = 0.0f;
     for (int d = lane; d < D; d += 32) {
@@ -571,6 +579,13 @@ __global__ void FlashAttention2BackwardKernel(
 
   // Loop over all K/V tiles for this Q tile.
   for (int k0 = 0; k0 < T; k0 += BK) {
+    if (causal) {
+      int q_max = q0 + q_tile - 1;
+      if (k0 > q_max) {
+        break;
+      }
+    }
+
     int k_tile = min(BK, T - k0);
 
     // Load this K/V tile.
@@ -613,9 +628,8 @@ __global__ void FlashAttention2BackwardKernel(
             part_dP += __shfl_down_sync(0xffffffff, part_dP, offset);
           }
           if (lane == 0) {
-            int row3 = ((b * H + h) * T + i);
             float score = part_score * softmax_scale;
-            p = expf(score - lse[row3]);
+            p = expf(score - lse_sh[warp_id]);
             dS = p * (part_dP - Drow_sh[warp_id]);
             p_sh[warp_id] = p;
             dS_sh[warp_id] = dS;
@@ -738,7 +752,7 @@ void FlashAttention2Backward(
     int blocksPerGrid = B * H * num_q_tiles;
 
     int D_PAD = D + 1;
-    size_t sharedFloats = (size_t)(4 * BQ * D_PAD + 4 * BK * D_PAD + 3 * BQ);
+    size_t sharedFloats = (size_t)(4 * BQ * D_PAD + 4 * BK * D_PAD + 4 * BQ);
     size_t sharedBytes = sharedFloats * sizeof(float);
 
     // Request larger dynamic shared-memory carveout when needed.
