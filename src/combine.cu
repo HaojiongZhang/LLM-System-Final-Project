@@ -486,151 +486,187 @@ __global__ void FlashAttention2BackwardKernel(
     int H,
     int T,
     int D,
+    int BQ,
     int BK,
     int causal,
     float softmax_scale)
 {
-  // Improved practical FA2-style mapping (loop order swapped):
-  // - one thread block owns one K/V tile for (b,h),
-  // - dK/dV are accumulated in shared memory and written once (no global atomics),
-  // - dQ is accumulated across K-tiles via global atomics.
-  // This directly targets previous dK/dV atomic contention bottlenecks.
+  // Q-tile-owned 2D tiled FA2 backward mapping:
+  // - one block owns one (b,h,q_tile),
+  // - each warp owns one query row in that tile,
+  // - block loops across all K/V tiles and accumulates full dQ privately,
+  // - dQ has no global atomics; dK/dV are accumulated per K tile then atomically flushed.
 
   int tile_id = blockIdx.x;
-  int num_k_tiles = (T + BK - 1) / BK;
-  int total_tiles = B * H * num_k_tiles;
+  int num_q_tiles = (T + BQ - 1) / BQ;
+  int total_tiles = B * H * num_q_tiles;
   if (tile_id >= total_tiles) {
     return;
   }
 
   int tid = threadIdx.x;
+  int lane = tid & 31;
+  int warp_id = tid >> 5;
 
-  // Decode flattened tile index into (b,h,k_tile_idx).
+  // Decode flattened tile index into (b,h,q_tile_idx).
   int rem = tile_id;
-  int k_tile_idx = rem % num_k_tiles;
-  rem /= num_k_tiles;
+  int q_tile_idx = rem % num_q_tiles;
+  rem /= num_q_tiles;
   int h = rem % H;
   int b = rem / H;
 
-  int k0 = k_tile_idx * BK;
-  int k_tile = min(BK, T - k0);
+  int q0 = q_tile_idx * BQ;
+  int q_tile = min(BQ, T - q0);
   int D_PAD = D + 1; // +1 padding helps avoid shared-memory bank conflicts when D is multiple of 32.
 
   // Dynamic shared-memory layout.
   extern __shared__ float smem[];
 
-  float* q_sh = smem;                                         // [D]
-  float* do_sh = q_sh + D;                                    // [D]
-  float* k_sh = do_sh + D;                                    // [BK * D_PAD]
+  float* q_sh = smem;                                          // [BQ * D_PAD]
+  float* do_sh = q_sh + BQ * D_PAD;                           // [BQ * D_PAD]
+  float* out_sh = do_sh + BQ * D_PAD;                         // [BQ * D_PAD]
+  float* dq_acc = out_sh + BQ * D_PAD;                        // [BQ * D_PAD]
+  float* k_sh = dq_acc + BQ * D_PAD;                          // [BK * D_PAD]
   float* v_sh = k_sh + BK * D_PAD;                            // [BK * D_PAD]
   float* dk_acc = v_sh + BK * D_PAD;                          // [BK * D_PAD]
   float* dv_acc = dk_acc + BK * D_PAD;                        // [BK * D_PAD]
-  float* red1 = dv_acc + BK * D_PAD;                          // [blockDim.x]
-  float* red2 = red1 + blockDim.x;                            // [blockDim.x]
+  float* Drow_sh = dv_acc + BK * D_PAD;                       // [BQ]
+  float* p_sh = Drow_sh + BQ;                                 // [BQ]
+  float* dS_sh = p_sh + BQ;                                   // [BQ]
 
-  // Load this block's K/V tile once.
-  for (int linear = tid; linear < k_tile * D; linear += blockDim.x) {
-    int tj = linear / D;
+  // Load this block's Q/dO/out tile once.
+  for (int linear = tid; linear < q_tile * D; linear += blockDim.x) {
+    int qi = linear / D;
     int d = linear % D;
-    int col4 = ((b * H + h) * T + (k0 + tj)) * D;
-    k_sh[tj * D_PAD + d] = k[col4 + d];
-    v_sh[tj * D_PAD + d] = v[col4 + d];
+    int row4 = ((b * H + h) * T + (q0 + qi)) * D;
+    q_sh[qi * D_PAD + d] = q[row4 + d];
+    do_sh[qi * D_PAD + d] = dout[row4 + d];
+    out_sh[qi * D_PAD + d] = out[row4 + d];
   }
 
-  // Initialize tile-local dK/dV accumulators in shared memory.
-  for (int linear = tid; linear < k_tile * D_PAD; linear += blockDim.x) {
+  // Initialize query-tile dQ accumulators in shared memory.
+  for (int linear = tid; linear < q_tile * D_PAD; linear += blockDim.x) {
     int d = linear % D_PAD;
     if (d < D) {
-      dk_acc[linear] = 0.0f;
-      dv_acc[linear] = 0.0f;
+      dq_acc[linear] = 0.0f;
     }
   }
   __syncthreads();
 
-  // For causal mode, i < k0 can never contribute to this K-tile.
-  int i_start = causal ? k0 : 0;
-
-  for (int i = i_start; i < T; ++i) {
-    int row4 = ((b * H + h) * T + i) * D;
-    int row3 = ((b * H + h) * T + i);
-
-    // Load row-local Q and dO once per i.
-    for (int d = tid; d < D; d += blockDim.x) {
-      q_sh[d] = q[row4 + d];
-      do_sh[d] = dout[row4 + d];
-    }
-    __syncthreads();
-
-    // D_i = dot(dO_i, O_i)
+  // Each warp owns one query row in the Q tile.
+  if (warp_id < q_tile) {
+    // Warp-level D_i = dot(dO_i, O_i) reduction.
     float part_D = 0.0f;
-    for (int d = tid; d < D; d += blockDim.x) {
-      part_D += do_sh[d] * out[row4 + d];
+    for (int d = lane; d < D; d += 32) {
+      part_D += do_sh[warp_id * D_PAD + d] * out_sh[warp_id * D_PAD + d];
     }
-    red1[tid] = part_D;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      part_D += __shfl_down_sync(0xffffffff, part_D, offset);
+    }
+    if (lane == 0) {
+      Drow_sh[warp_id] = part_D;
+    }
+  }
+  __syncthreads();
+
+  // Loop over all K/V tiles for this Q tile.
+  for (int k0 = 0; k0 < T; k0 += BK) {
+    int k_tile = min(BK, T - k0);
+
+    // Load this K/V tile.
+    for (int linear = tid; linear < k_tile * D; linear += blockDim.x) {
+      int tj = linear / D;
+      int d = linear % D;
+      int col4 = ((b * H + h) * T + (k0 + tj)) * D;
+      k_sh[tj * D_PAD + d] = k[col4 + d];
+      v_sh[tj * D_PAD + d] = v[col4 + d];
+    }
+
+    // Reset tile-local dK/dV accumulators.
+    for (int linear = tid; linear < k_tile * D_PAD; linear += blockDim.x) {
+      int d = linear % D_PAD;
+      if (d < D) {
+        dk_acc[linear] = 0.0f;
+        dv_acc[linear] = 0.0f;
+      }
+    }
     __syncthreads();
-    for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
-      if (tid < offset) {
-        red1[tid] += red1[tid + offset];
+
+    // For each column inside this K tile, compute p/dS for each query row.
+    for (int tj = 0; tj < k_tile; ++tj) {
+      if (warp_id < q_tile) {
+        int j = k0 + tj;
+        int i = q0 + warp_id;
+
+        float p = 0.0f;
+        float dS = 0.0f;
+        if (!causal || j <= i) {
+          float part_score = 0.0f;
+          float part_dP = 0.0f;
+          for (int d = lane; d < D; d += 32) {
+            float qv = q_sh[warp_id * D_PAD + d];
+            part_score += qv * k_sh[tj * D_PAD + d];
+            part_dP += do_sh[warp_id * D_PAD + d] * v_sh[tj * D_PAD + d];
+          }
+          for (int offset = 16; offset > 0; offset >>= 1) {
+            part_score += __shfl_down_sync(0xffffffff, part_score, offset);
+            part_dP += __shfl_down_sync(0xffffffff, part_dP, offset);
+          }
+          if (lane == 0) {
+            int row3 = ((b * H + h) * T + i);
+            float score = part_score * softmax_scale;
+            p = expf(score - lse[row3]);
+            dS = p * (part_dP - Drow_sh[warp_id]);
+            p_sh[warp_id] = p;
+            dS_sh[warp_id] = dS;
+          }
+        } else if (lane == 0) {
+          p_sh[warp_id] = 0.0f;
+          dS_sh[warp_id] = 0.0f;
+        }
+      }
+      __syncthreads();
+
+      // dQ shared accumulation: one warp per query row.
+      if (warp_id < q_tile) {
+        float dS = dS_sh[warp_id];
+        for (int d = lane; d < D; d += 32) {
+          float kv = k_sh[tj * D_PAD + d];
+          dq_acc[warp_id * D_PAD + d] += dS * kv * softmax_scale;
+        }
+      }
+
+      // dK/dV register accumulation across Q rows, then shared accumulation.
+      for (int d = tid; d < D; d += blockDim.x) {
+        float dk_sum = 0.0f;
+        float dv_sum = 0.0f;
+        for (int qi = 0; qi < q_tile; ++qi) {
+          dk_sum += dS_sh[qi] * q_sh[qi * D_PAD + d] * softmax_scale;
+          dv_sum += p_sh[qi] * do_sh[qi * D_PAD + d];
+        }
+        dk_acc[tj * D_PAD + d] += dk_sum;
+        dv_acc[tj * D_PAD + d] += dv_sum;
       }
       __syncthreads();
     }
-    float Drow = red1[0];
 
-    // Traverse this K-tile.
-    for (int tj = 0; tj < k_tile; ++tj) {
-      int j = k0 + tj;
-      if (causal && j > i) {
-        continue;
-      }
-
-      float part_score = 0.0f;
-      float part_dP = 0.0f;
-      for (int d = tid; d < D; d += blockDim.x) {
-        float kval = k_sh[tj * D_PAD + d];
-        float vval = v_sh[tj * D_PAD + d];
-        part_score += q_sh[d] * kval;
-        part_dP += do_sh[d] * vval;
-      }
-      red1[tid] = part_score;
-      red2[tid] = part_dP;
-      __syncthreads();
-
-      for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
-        if (tid < offset) {
-          red1[tid] += red1[tid + offset];
-          red2[tid] += red2[tid + offset];
-        }
-        __syncthreads();
-      }
-
-      float score = red1[0] * softmax_scale;
-      float dP = red2[0];
-      float p = expf(score - lse[row3]);
-      float dS = p * (dP - Drow);
-
-      // dQ is shared across K-tiles -> still requires atomics.
-      for (int d = tid; d < D; d += blockDim.x) {
-        float kval = k_sh[tj * D_PAD + d];
-        atomicAdd(&dq[row4 + d], dS * kval * softmax_scale);
-      }
-
-      // dK/dV are tile-private in this mapping -> shared accumulation without atomics.
-      for (int d = tid; d < D; d += blockDim.x) {
-        dk_acc[tj * D_PAD + d] += dS * q_sh[d] * softmax_scale;
-        dv_acc[tj * D_PAD + d] += p * do_sh[d];
-      }
-      __syncthreads();
+    // Flush this K/V-tile dK/dV (global atomic across Q tiles).
+    for (int linear = tid; linear < k_tile * D; linear += blockDim.x) {
+      int tj = linear / D;
+      int d = linear % D;
+      int col4 = ((b * H + h) * T + (k0 + tj)) * D;
+      atomicAdd(&dk[col4 + d], dk_acc[tj * D_PAD + d]);
+      atomicAdd(&dv[col4 + d], dv_acc[tj * D_PAD + d]);
     }
     __syncthreads();
   }
 
-  // Write tile-owned dK/dV back once (no atomics).
-  for (int linear = tid; linear < k_tile * D; linear += blockDim.x) {
-    int tj = linear / D;
+  // Flush full query-tile dQ once to global (no atomics needed: unique owner block).
+  for (int linear = tid; linear < q_tile * D; linear += blockDim.x) {
+    int qi = linear / D;
     int d = linear % D;
-    int col4 = ((b * H + h) * T + (k0 + tj)) * D;
-    dk[col4 + d] = dk_acc[tj * D_PAD + d];
-    dv[col4 + d] = dv_acc[tj * D_PAD + d];
+    int row4 = ((b * H + h) * T + (q0 + qi)) * D;
+    dq[row4 + d] = dq_acc[qi * D_PAD + d];
   }
 }
 
@@ -689,25 +725,20 @@ void FlashAttention2Backward(
     cudaMemset(d_dk, 0, size4 * sizeof(float));
     cudaMemset(d_dv, 0, size4 * sizeof(float));
 
-    // One block per K/V tile (b,h,k_tile).
-    int threadsPerBlock = 256;
-    if (D < threadsPerBlock) {
-      // Keep a power-of-two-ish block size for reduction efficiency.
-      threadsPerBlock = 1;
-      while (threadsPerBlock < D && threadsPerBlock < 256) {
-        threadsPerBlock <<= 1;
-      }
+    // 2D tiling parameters (Q tile x K tile).
+    int BQ = (D <= 64) ? 8 : 4;   // warps per block (one warp per query row)
+    int BK = (D <= 64) ? 32 : 16; // K/V tile size
+
+    int threadsPerBlock = BQ * 32;
+    if (threadsPerBlock > 256) {
+      threadsPerBlock = 256;
     }
 
-    // Adaptive K/V tile size:
-    // - prefer larger tiles when D is small,
-    // - keep shared-memory usage bounded for larger D.
-    int BK = (D <= 64) ? 64 : 32;
-    int num_k_tiles = (T + BK - 1) / BK;
-    int blocksPerGrid = B * H * num_k_tiles;
+    int num_q_tiles = (T + BQ - 1) / BQ;
+    int blocksPerGrid = B * H * num_q_tiles;
 
     int D_PAD = D + 1;
-    size_t sharedFloats = (size_t)(2 * D + 4 * BK * D_PAD + 2 * threadsPerBlock);
+    size_t sharedFloats = (size_t)(4 * BQ * D_PAD + 4 * BK * D_PAD + 3 * BQ);
     size_t sharedBytes = sharedFloats * sizeof(float);
 
     // Request larger dynamic shared-memory carveout when needed.
@@ -730,6 +761,7 @@ void FlashAttention2Backward(
         H,
         T,
         D,
+        BQ,
         BK,
         causal,
         softmax_scale);
