@@ -486,103 +486,115 @@ __global__ void FlashAttention2BackwardKernel(
     int H,
     int T,
     int D,
+    int BK,
     int causal,
     float softmax_scale)
 {
-  // Practical FA2-style mapping:
-  // - one thread block handles one query row (b,h,i),
-  // - iterate keys in tiles loaded to shared memory,
-  // - avoid atomics for dQ row accumulation,
-  // - keep atomics only where cross-row conflicts are unavoidable (dK/dV).
+  // Improved practical FA2-style mapping (loop order swapped):
+  // - one thread block owns one K/V tile for (b,h),
+  // - dK/dV are accumulated in shared memory and written once (no global atomics),
+  // - dQ is accumulated across K-tiles via global atomics.
+  // This directly targets previous dK/dV atomic contention bottlenecks.
 
-  int row = blockIdx.x;
-  int total_rows = B * H * T;
-  if (row >= total_rows) {
+  int tile_id = blockIdx.x;
+  int num_k_tiles = (T + BK - 1) / BK;
+  int total_tiles = B * H * num_k_tiles;
+  if (tile_id >= total_tiles) {
     return;
   }
 
   int tid = threadIdx.x;
 
-  // Decode flattened row index into (b,h,i).
-  int rem = row;
-  int i = rem % T;
-  rem /= T;
+  // Decode flattened tile index into (b,h,k_tile_idx).
+  int rem = tile_id;
+  int k_tile_idx = rem % num_k_tiles;
+  rem /= num_k_tiles;
   int h = rem % H;
   int b = rem / H;
 
-  // Flat row offsets into compact (B,H,T,D) and (B,H,T) layouts.
-  int row4 = ((b * H + h) * T + i) * D;
-  int row3 = ((b * H + h) * T + i);
+  int k0 = k_tile_idx * BK;
+  int k_tile = min(BK, T - k0);
+  int D_PAD = D + 1; // +1 padding helps avoid shared-memory bank conflicts when D is multiple of 32.
 
-  // Tile size over key dimension and dynamic shared-memory layout.
-  const int BK = 16;
+  // Dynamic shared-memory layout.
   extern __shared__ float smem[];
 
-  float* q_sh = smem;                           // [D]
-  float* do_sh = q_sh + D;                      // [D]
-  float* k_sh = do_sh + D;                      // [BK * D]
-  float* v_sh = k_sh + BK * D;                  // [BK * D]
-  float* red1 = v_sh + BK * D;                  // [blockDim.x]
-  float* red2 = red1 + blockDim.x;              // [blockDim.x]
+  float* q_sh = smem;                                         // [D]
+  float* do_sh = q_sh + D;                                    // [D]
+  float* k_sh = do_sh + D;                                    // [BK * D_PAD]
+  float* v_sh = k_sh + BK * D_PAD;                            // [BK * D_PAD]
+  float* dk_acc = v_sh + BK * D_PAD;                          // [BK * D_PAD]
+  float* dv_acc = dk_acc + BK * D_PAD;                        // [BK * D_PAD]
+  float* red1 = dv_acc + BK * D_PAD;                          // [blockDim.x]
+  float* red2 = red1 + blockDim.x;                            // [blockDim.x]
 
-  // Load q_i and dO_i once into shared memory.
-  for (int d = tid; d < D; d += blockDim.x) {
-    q_sh[d] = q[row4 + d];
-    do_sh[d] = dout[row4 + d];
+  // Load this block's K/V tile once.
+  for (int linear = tid; linear < k_tile * D; linear += blockDim.x) {
+    int tj = linear / D;
+    int d = linear % D;
+    int col4 = ((b * H + h) * T + (k0 + tj)) * D;
+    k_sh[tj * D_PAD + d] = k[col4 + d];
+    v_sh[tj * D_PAD + d] = v[col4 + d];
+  }
+
+  // Initialize tile-local dK/dV accumulators in shared memory.
+  for (int linear = tid; linear < k_tile * D_PAD; linear += blockDim.x) {
+    int d = linear % D_PAD;
+    if (d < D) {
+      dk_acc[linear] = 0.0f;
+      dv_acc[linear] = 0.0f;
+    }
   }
   __syncthreads();
 
-  // D_i = dot(dO_i, O_i), computed once per row.
-  float part_D = 0.0f;
-  for (int d = tid; d < D; d += blockDim.x) {
-    part_D += do_sh[d] * out[row4 + d];
-  }
-  red1[tid] = part_D;
-  __syncthreads();
-  for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
-    if (tid < offset) {
-      red1[tid] += red1[tid + offset];
-    }
-    __syncthreads();
-  }
-  float Drow = red1[0];
+  // For causal mode, i < k0 can never contribute to this K-tile.
+  int i_start = causal ? k0 : 0;
 
-  // Walk over key/value tiles.
-  for (int k0 = 0; k0 < T; k0 += BK) {
-    int k_tile = min(BK, T - k0);
+  for (int i = i_start; i < T; ++i) {
+    int row4 = ((b * H + h) * T + i) * D;
+    int row3 = ((b * H + h) * T + i);
 
-    // Load K and V tile to shared memory.
-    for (int linear = tid; linear < k_tile * D; linear += blockDim.x) {
-      int tj = linear / D;
-      int d = linear % D;
-      int col4 = ((b * H + h) * T + (k0 + tj)) * D;
-      k_sh[tj * D + d] = k[col4 + d];
-      v_sh[tj * D + d] = v[col4 + d];
+    // Load row-local Q and dO once per i.
+    for (int d = tid; d < D; d += blockDim.x) {
+      q_sh[d] = q[row4 + d];
+      do_sh[d] = dout[row4 + d];
     }
     __syncthreads();
 
+    // D_i = dot(dO_i, O_i)
+    float part_D = 0.0f;
+    for (int d = tid; d < D; d += blockDim.x) {
+      part_D += do_sh[d] * out[row4 + d];
+    }
+    red1[tid] = part_D;
+    __syncthreads();
+    for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
+      if (tid < offset) {
+        red1[tid] += red1[tid + offset];
+      }
+      __syncthreads();
+    }
+    float Drow = red1[0];
+
+    // Traverse this K-tile.
     for (int tj = 0; tj < k_tile; ++tj) {
       int j = k0 + tj;
       if (causal && j > i) {
         continue;
       }
 
-      // score_ij = scale * dot(q_i, k_j)
       float part_score = 0.0f;
-      for (int d = tid; d < D; d += blockDim.x) {
-        part_score += q_sh[d] * k_sh[tj * D + d];
-      }
-      red1[tid] = part_score;
-
-      // dP_ij = dot(dO_i, V_j)
       float part_dP = 0.0f;
       for (int d = tid; d < D; d += blockDim.x) {
-        part_dP += do_sh[d] * v_sh[tj * D + d];
+        float kval = k_sh[tj * D_PAD + d];
+        float vval = v_sh[tj * D_PAD + d];
+        part_score += q_sh[d] * kval;
+        part_dP += do_sh[d] * vval;
       }
+      red1[tid] = part_score;
       red2[tid] = part_dP;
       __syncthreads();
 
-      // Reduce both scalars cooperatively.
       for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
         if (tid < offset) {
           red1[tid] += red1[tid + offset];
@@ -596,18 +608,29 @@ __global__ void FlashAttention2BackwardKernel(
       float p = expf(score - lse[row3]);
       float dS = p * (dP - Drow);
 
-      // Per-dimension updates.
-      // - dQ row is unique to this block -> no atomics needed.
-      // - dK/dV are shared across many rows -> atomicAdd required.
-      int col4 = ((b * H + h) * T + j) * D;
+      // dQ is shared across K-tiles -> still requires atomics.
       for (int d = tid; d < D; d += blockDim.x) {
-        dq[row4 + d] += dS * k_sh[tj * D + d] * softmax_scale;
-        atomicAdd(&dk[col4 + d], dS * q_sh[d] * softmax_scale);
-        atomicAdd(&dv[col4 + d], p * do_sh[d]);
+        float kval = k_sh[tj * D_PAD + d];
+        atomicAdd(&dq[row4 + d], dS * kval * softmax_scale);
+      }
+
+      // dK/dV are tile-private in this mapping -> shared accumulation without atomics.
+      for (int d = tid; d < D; d += blockDim.x) {
+        dk_acc[tj * D_PAD + d] += dS * q_sh[d] * softmax_scale;
+        dv_acc[tj * D_PAD + d] += p * do_sh[d];
       }
       __syncthreads();
     }
     __syncthreads();
+  }
+
+  // Write tile-owned dK/dV back once (no atomics).
+  for (int linear = tid; linear < k_tile * D; linear += blockDim.x) {
+    int tj = linear / D;
+    int d = linear % D;
+    int col4 = ((b * H + h) * T + (k0 + tj)) * D;
+    dk[col4 + d] = dk_acc[tj * D_PAD + d];
+    dv[col4 + d] = dv_acc[tj * D_PAD + d];
   }
 }
 
@@ -661,13 +684,12 @@ void FlashAttention2Backward(
     cudaMemcpy(d_out, out, size4 * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(d_lse, lse, size3 * sizeof(float), cudaMemcpyHostToDevice);
 
-    // Zero output gradient buffers before atomic accumulation in kernel.
+    // Zero output gradient buffers before accumulation in kernel.
     cudaMemset(d_dq, 0, size4 * sizeof(float));
     cudaMemset(d_dk, 0, size4 * sizeof(float));
     cudaMemset(d_dv, 0, size4 * sizeof(float));
 
-    // One block per query row (b,h,i); each block iterates key tiles.
-    int total_rows = B * H * T;
+    // One block per K/V tile (b,h,k_tile).
     int threadsPerBlock = 256;
     if (D < threadsPerBlock) {
       // Keep a power-of-two-ish block size for reduction efficiency.
@@ -676,9 +698,23 @@ void FlashAttention2Backward(
         threadsPerBlock <<= 1;
       }
     }
-    int blocksPerGrid = total_rows;
-    const int BK = 16;
-    size_t sharedBytes = (size_t)(2 * D + 2 * BK * D + 2 * threadsPerBlock) * sizeof(float);
+
+    // Adaptive K/V tile size:
+    // - prefer larger tiles when D is small,
+    // - keep shared-memory usage bounded for larger D.
+    int BK = (D <= 64) ? 64 : 32;
+    int num_k_tiles = (T + BK - 1) / BK;
+    int blocksPerGrid = B * H * num_k_tiles;
+
+    int D_PAD = D + 1;
+    size_t sharedFloats = (size_t)(2 * D + 4 * BK * D_PAD + 2 * threadsPerBlock);
+    size_t sharedBytes = sharedFloats * sizeof(float);
+
+    // Request larger dynamic shared-memory carveout when needed.
+    cudaFuncSetAttribute(
+        FlashAttention2BackwardKernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        (int)sharedBytes);
 
     FlashAttention2BackwardKernel<<<blocksPerGrid, threadsPerBlock, sharedBytes>>>(
         d_dout,
@@ -694,6 +730,7 @@ void FlashAttention2Backward(
         H,
         T,
         D,
+        BK,
         causal,
         softmax_scale);
 

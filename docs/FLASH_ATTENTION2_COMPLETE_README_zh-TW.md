@@ -120,14 +120,15 @@ CUDA kernel 實作 + C ABI wrapper。
 
 關鍵元素：
 - `FlashAttention2BackwardKernel(...)`
-  - 每個 block 負責一個 query row `(b,h,i)`
-  - key/value 採 shared memory 分塊（`BK=16`）
+  - 每個 block 擁有一個 K/V tile `(b,h,k_tile)`
+  - key tile 大小自適應（`D<=64` 用 `BK=64`，否則 `BK=32`）
+  - shared memory 暫存 `K_j`、`V_j`，並以 padding（`D+1`）降低 bank conflict
   - block 內合作 reduction 計算：
     - `dot(q_i, k_j)`（score）
     - `dP_ij = dot(dO_i, V_j)`
     - `D_i = dot(dO_i, O_i)`
-  - `dQ` 由 row-private block 直接累積（不需要 atomic）
-  - `dK` / `dV` 僅在跨 row 寫入衝突處使用 atomic
+  - `dK` / `dV` 先在 shared tile 累積，再一次寫回（大幅降低 global atomic）
+  - `dQ` 因 query row 會被多個 `k_tile` block 造訪，仍需 atomic
 - `extern "C" void FlashAttention2Backward(...)`
   - 供 `ctypes` 呼叫的入口
   - alloc/copy/launch/copy-back/free
@@ -135,7 +136,7 @@ CUDA kernel 實作 + C ABI wrapper。
 備註：
 - 目前已是較實務的 tiled kernel（不再是單純 pairwise kernel）
 - 透過 shared memory 提升資料區域性並降低 global memory 流量
-- 僅保留必要的 atomic 以處理不可避免的累積衝突
+- 主要 global 競爭已從 `dK/dV` 轉移；剩餘明顯競爭點為 `dQ` atomic
 
 ---
 
@@ -220,31 +221,27 @@ PSC GPU 批次驗證腳本。
 ## 8) 最新 GPU 驗證結果（PSC）
 
 最新驗證工作：
-- Job ID：`37923424`
+- Job ID：`37923696`
 - 狀態：`COMPLETED`
 - ExitCode：`0:0`
-- Log：`fa2_cuda_test_37923424.log`
+- Log：`fa2_cuda_test_37923696.log`
 
 觀察結果：
 - FA2 backward 測試：`6 passed`
 - 額外 CUDA 路徑檢查：成功
 - 簡易時間量測（單次、含 Python/封裝層開銷）：
   - shape `(B=2,H=4,T=128,D=64)`
-  - `cuda_ms=2525.329`
-  - `ref_ms=2489.146`
-  - 速度比（`ref/cuda`）`= 0.99x`
+  - `cuda_ms=2397.886`
+  - `ref_ms=2346.258`
+  - 速度比（`ref/cuda`）`= 0.98x`
 
 解讀：
-- kernel 已改為 shared-memory tiled 的硬體導向實作，
-- 但端到端時間仍受 host-device copy 與 `dK/dV` 的 atomic 累積成本影響。
+- kernel 已改為 K/V-tile ownership，且 `dK/dV` 先在 shared memory 累積後再寫回，
+- 但端到端時間仍受封裝層 H2D/D2H copy 與 `dQ` atomic 成本影響。
 
 ---
 
 ## 9) 相關文件
 
-- `docs/FLASH_ATTENTION2_BACKWARD.md`
-- `docs/FLASH_ATTENTION2_BACKWARD_zh-TW.md`
-- `docs/FLASH_ATTENTION2_BACKWARD_DEVELOPER_GUIDE.md`
-- `docs/FLASH_ATTENTION2_BACKWARD_DEVELOPER_GUIDE_zh-TW.md`
-- `docs/FLASH_ATTENTION2_BACKWARD_CUDA.md`
-- `docs/FLASH_ATTENTION2_BACKWARD_CUDA_zh-TW.md`
+- `docs/FLASH_ATTENTION2_COMPLETE_README.md`
+- `docs/FLASH_ATTENTION2_COMPLETE_README_zh-TW.md`

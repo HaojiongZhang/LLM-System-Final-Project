@@ -120,14 +120,15 @@ CUDA kernel implementation + C ABI wrapper.
 
 Key elements:
 - `FlashAttention2BackwardKernel(...)`
-  - one block per query row `(b,h,i)`
-  - key/value dimension processed in shared-memory tiles (`BK=16`)
+  - one block owns one K/V tile `(b,h,k_tile)`
+  - adaptive key tile size (`BK=64` when `D<=64`, else `BK=32`)
+  - shared-memory staging for `K_j`, `V_j`, plus padded shared accumulators (`D+1`) to reduce bank conflicts
   - cooperative reductions inside block for:
     - score dot product `dot(q_i, k_j)`
     - `dP_ij = dot(dO_i, V_j)`
     - row scalar `D_i = dot(dO_i, O_i)`
-  - `dQ` accumulated without atomics (row-private block ownership)
-  - `dK` / `dV` use atomic add only where cross-row write conflicts exist
+  - `dK` / `dV` are first accumulated in shared tile buffers, then written once per tile (greatly reducing global atomics)
+  - `dQ` still uses atomic add because each query row is now visited by multiple `k_tile` blocks
 - `extern "C" void FlashAttention2Backward(...)`
   - entrypoint called by `ctypes`
   - alloc/copy/launch/copy-back/free
@@ -135,7 +136,7 @@ Key elements:
 Notes:
 - this implementation is now a practical tiled kernel (not a naive pairwise kernel)
 - shared memory is used to leverage locality and reduce global-memory traffic
-- selective atomics are kept only for unavoidable accumulation conflicts
+- global contention moved away from `dK/dV`; remaining major write contention is on `dQ`
 
 ---
 
@@ -220,32 +221,28 @@ Pipeline:
 ## 8) Latest GPU validation (PSC)
 
 Latest validation job:
-- Job ID: `37923424`
+- Job ID: `37923696`
 - State: `COMPLETED`
 - ExitCode: `0:0`
-- Log: `fa2_cuda_test_37923424.log`
+- Log: `fa2_cuda_test_37923696.log`
 
 Observed outputs:
 - FA2 backward tests: `6 passed`
 - Explicit CUDA path check: success
 - Timing probe (single-run, includes Python + wrapper overhead):
   - shape `(B=2,H=4,T=128,D=64)`
-  - `cuda_ms=2525.329`
-  - `ref_ms=2489.146`
-  - speedup ratio (`ref/cuda`) `= 0.99x`
+  - `cuda_ms=2397.886`
+  - `ref_ms=2346.258`
+  - speedup ratio (`ref/cuda`) `= 0.98x`
 
 Interpretation:
-- kernel is now tiled and hardware-aware,
-- but end-to-end runtime is still dominated by host-device copy overhead and
-  remaining atomic accumulation on `dK/dV` in this wrapper path.
+- kernel now uses K/V-tile ownership with shared accumulation for `dK/dV`,
+- but end-to-end runtime is still dominated by wrapper overhead (H2D/D2H copies)
+  and remaining `dQ` atomic accumulation.
 
 ---
 
 ## 9) Related docs
 
-- `docs/FLASH_ATTENTION2_BACKWARD.md`
-- `docs/FLASH_ATTENTION2_BACKWARD_zh-TW.md`
-- `docs/FLASH_ATTENTION2_BACKWARD_DEVELOPER_GUIDE.md`
-- `docs/FLASH_ATTENTION2_BACKWARD_DEVELOPER_GUIDE_zh-TW.md`
-- `docs/FLASH_ATTENTION2_BACKWARD_CUDA.md`
-- `docs/FLASH_ATTENTION2_BACKWARD_CUDA_zh-TW.md`
+- `docs/FLASH_ATTENTION2_COMPLETE_README.md`
+- `docs/FLASH_ATTENTION2_COMPLETE_README_zh-TW.md`
