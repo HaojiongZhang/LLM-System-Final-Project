@@ -87,13 +87,23 @@ class CudaKernelOps(TensorOps):
             )
 
         # Convert miniTorch tensors to contiguous host buffers.
-        # The C wrapper handles H2D/D2H copies internally.
-        dout_np = np.ascontiguousarray(dout.to_numpy(), dtype=np.float32)
-        q_np = np.ascontiguousarray(q.to_numpy(), dtype=np.float32)
-        k_np = np.ascontiguousarray(k.to_numpy(), dtype=np.float32)
-        v_np = np.ascontiguousarray(v.to_numpy(), dtype=np.float32)
-        out_np = np.ascontiguousarray(out.to_numpy(), dtype=np.float32)
-        lse_np = np.ascontiguousarray(logsumexp.to_numpy(), dtype=np.float32)
+        # Fast-path: when underlying storage is already contiguous host NumPy,
+        # avoid extra materialization through `to_numpy()`.
+        def _to_host_contiguous_np(x: Tensor) -> np.ndarray:
+            td = x._tensor
+            if td.is_contiguous() and isinstance(td._storage, np.ndarray):
+                arr = td._storage
+                if arr.dtype != np.float32:
+                    arr = arr.astype(np.float32, copy=False)
+                return np.ascontiguousarray(arr.reshape(x.shape), dtype=np.float32)
+            return np.ascontiguousarray(x.to_numpy(), dtype=np.float32)
+
+        dout_np = _to_host_contiguous_np(dout)
+        q_np = _to_host_contiguous_np(q)
+        k_np = _to_host_contiguous_np(k)
+        v_np = _to_host_contiguous_np(v)
+        out_np = _to_host_contiguous_np(out)
+        lse_np = _to_host_contiguous_np(logsumexp)
 
         # Accept either (B,H,T) or (B,H,T,1) and canonicalize.
         if lse_np.ndim == 4 and lse_np.shape[-1] == 1:
@@ -118,10 +128,10 @@ class CudaKernelOps(TensorOps):
         if softmax_scale is None:
             softmax_scale = 1.0 / np.sqrt(float(headdim))
 
-        # Output gradients are materialized on host, then wrapped as Tensor.
-        dq_np = np.zeros_like(q_np, dtype=np.float32)
-        dk_np = np.zeros_like(k_np, dtype=np.float32)
-        dv_np = np.zeros_like(v_np, dtype=np.float32)
+        # Output gradients are fully written by CUDA wrapper.
+        dq_np = np.empty_like(q_np, dtype=np.float32)
+        dk_np = np.empty_like(k_np, dtype=np.float32)
+        dv_np = np.empty_like(v_np, dtype=np.float32)
 
         # ABI contract for C function:
         # FlashAttention2Backward(float* dout, float* q, ..., int B,H,T,D,
