@@ -105,6 +105,7 @@ Key elements:
 - `CudaKernelOps.flash_attention2_backward(...)`
   - validates shapes
   - canonicalizes `logsumexp`
+  - fast-paths contiguous host storage to reduce extra `to_numpy()` copies
   - sets C ABI argtypes
   - calls C wrapper
   - wraps outputs to tensors
@@ -112,6 +113,7 @@ Key elements:
 How it works:
 - Python passes contiguous 1D views + explicit dimensions `(B,H,T,D)`.
 - C wrapper handles H2D copy, kernel launch, D2H copy.
+- output host buffers use `np.empty_like(...)` since CUDA fully overwrites gradients.
 
 ---
 
@@ -120,23 +122,26 @@ CUDA kernel implementation + C ABI wrapper.
 
 Key elements:
 - `FlashAttention2BackwardKernel(...)`
-  - one block owns one K/V tile `(b,h,k_tile)`
-  - adaptive key tile size (`BK=64` when `D<=64`, else `BK=32`)
-  - shared-memory staging for `K_j`, `V_j`, plus padded shared accumulators (`D+1`) to reduce bank conflicts
+  - one block owns one Q tile `(b,h,q_tile)` and loops over K/V tiles
+  - architecture-aware tile sizing (`BQ/BK`) from GPU SM version + `D`
+  - shared-memory staging for `Q/dO/out` and `K/V`, padded with `D+1`
+  - vectorized `float4` global-memory path when `D % 4 == 0`
   - cooperative reductions inside block for:
     - score dot product `dot(q_i, k_j)`
     - `dP_ij = dot(dO_i, V_j)`
     - row scalar `D_i = dot(dO_i, O_i)`
-  - `dK` / `dV` are first accumulated in shared tile buffers, then written once per tile (greatly reducing global atomics)
-  - `dQ` still uses atomic add because each query row is now visited by multiple `k_tile` blocks
+  - optional WMMA/Tensor-Core dot path for `D % 16 == 0` (heuristic-enabled)
+  - `dQ` is block-private accumulated then written once (no global atomic in current mapping)
+  - `dK` / `dV` are tile-local accumulated then atomically merged across Q tiles
 - `extern "C" void FlashAttention2Backward(...)`
   - entrypoint called by `ctypes`
-  - alloc/copy/launch/copy-back/free
+  - persistent grow-on-demand GPU buffers
+  - async H2D/D2H copies + async memset + single stream sync
 
 Notes:
 - this implementation is now a practical tiled kernel (not a naive pairwise kernel)
-- shared memory is used to leverage locality and reduce global-memory traffic
-- global contention moved away from `dK/dV`; remaining major write contention is on `dQ`
+- shared memory + vectorized access improve locality and bandwidth usage
+- largest recent speedup came from reducing wrapper overhead (persistent allocs + async transfers)
 
 ---
 
@@ -156,9 +161,17 @@ Covers:
 - invalid shape/tile rejection
 - forward-context helper equivalence
 
+### 4.6 `tests/test_flash_attention2_smoke.py`
+Lightweight quick-check tests.
+
+Covers:
+- finite/shape sanity on reference path
+- CUDA-vs-reference parity on small case
+- CUDA repeatability sanity
+
 ---
 
-### 4.6 `run_fa2_cuda_tests.slurm`
+### 4.7 `run_fa2_cuda_tests.slurm`
 PSC GPU batch validation script.
 
 Pipeline:
@@ -221,24 +234,32 @@ Pipeline:
 ## 8) Latest GPU validation (PSC)
 
 Latest validation job:
-- Job ID: `37923696`
+- Job ID: `37945129`
 - State: `COMPLETED`
 - ExitCode: `0:0`
-- Log: `fa2_cuda_test_37923696.log`
+- Log: `fa2_cuda_test_37945129.log`
 
 Observed outputs:
 - FA2 backward tests: `6 passed`
 - Explicit CUDA path check: success
 - Timing probe (single-run, includes Python + wrapper overhead):
   - shape `(B=2,H=4,T=128,D=64)`
-  - `cuda_ms=2397.886`
-  - `ref_ms=2346.258`
-  - speedup ratio (`ref/cuda`) `= 0.98x`
+  - `cuda_ms=1.289`
+  - `ref_ms=2295.139`
+  - speedup ratio (`ref/cuda`) `= 1780.26x`
+
+Additional quick comparison (same shape):
+- Job ID: `37945237`
+- FA2 CUDA: `1.737 ms`
+- FA2 NumPy blocked: `2351.427 ms`
+- dense attention backward NumPy (non-FA): `2.548 ms`
+- CUDA speedup vs FA2 NumPy blocked: `1353.65x`
+- CUDA speedup vs dense NumPy backward: `1.47x`
 
 Interpretation:
-- kernel now uses K/V-tile ownership with shared accumulation for `dK/dV`,
-- but end-to-end runtime is still dominated by wrapper overhead (H2D/D2H copies)
-  and remaining `dQ` atomic accumulation.
+- current implementation combines algorithmic and systems optimizations.
+- most recent large gain came from eliminating per-call wrapper overhead.
+- for this workload, CUDA FA2 is substantially faster than NumPy baselines.
 
 ---
 

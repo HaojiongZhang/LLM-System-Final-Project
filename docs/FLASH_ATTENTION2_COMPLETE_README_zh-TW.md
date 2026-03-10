@@ -105,6 +105,7 @@ Python 到 CUDA 的 `ctypes` 橋接層。
 - `CudaKernelOps.flash_attention2_backward(...)`
   - shape 驗證
   - `logsumexp` 正規化
+  - contiguous host storage 快速路徑（減少額外 `to_numpy()` 複製）
   - 設定 C ABI `argtypes`
   - 呼叫 C wrapper
   - 包裝輸出成 tensor
@@ -112,6 +113,7 @@ Python 到 CUDA 的 `ctypes` 橋接層。
 運作方式：
 - Python 傳入 contiguous 1D 記憶體 + 額外 `(B,H,T,D)` 維度。
 - C wrapper 內部做 H2D / kernel launch / D2H。
+- 輸出 host 緩衝改用 `np.empty_like(...)`，因為 CUDA 會完整覆寫梯度。
 
 ---
 
@@ -120,23 +122,26 @@ CUDA kernel 實作 + C ABI wrapper。
 
 關鍵元素：
 - `FlashAttention2BackwardKernel(...)`
-  - 每個 block 擁有一個 K/V tile `(b,h,k_tile)`
-  - key tile 大小自適應（`D<=64` 用 `BK=64`，否則 `BK=32`）
-  - shared memory 暫存 `K_j`、`V_j`，並以 padding（`D+1`）降低 bank conflict
+  - 每個 block 擁有一個 Q tile `(b,h,q_tile)`，並在 block 內掃過 K/V tiles
+  - 依 GPU SM 與 `D` 自適應選擇 `BQ/BK`
+  - shared memory 暫存 `Q/dO/out` 與 `K/V`，並以 `D+1` padding 降低 bank conflict
+  - 當 `D % 4 == 0` 時使用 `float4` 向量化 global memory 存取
   - block 內合作 reduction 計算：
     - `dot(q_i, k_j)`（score）
     - `dP_ij = dot(dO_i, V_j)`
     - `D_i = dot(dO_i, O_i)`
-  - `dK` / `dV` 先在 shared tile 累積，再一次寫回（大幅降低 global atomic）
-  - `dQ` 因 query row 會被多個 `k_tile` block 造訪，仍需 atomic
+  - 當 `D % 16 == 0` 時可選用 WMMA/Tensor Core dot 路徑（依 heuristic 啟用）
+  - `dQ` 在 block 內私有累積後一次寫回（目前 mapping 不需要 global atomic）
+  - `dK` / `dV` 在 tile 內累積後，跨 Q tiles 以 atomic 合併
 - `extern "C" void FlashAttention2Backward(...)`
   - 供 `ctypes` 呼叫的入口
-  - alloc/copy/launch/copy-back/free
+  - 持久化、可擴張的 GPU 緩衝（避免每次 alloc/free）
+  - 非同步 H2D/D2H copy + 非同步 memset + 單次 stream 同步
 
 備註：
 - 目前已是較實務的 tiled kernel（不再是單純 pairwise kernel）
-- 透過 shared memory 提升資料區域性並降低 global memory 流量
-- 主要 global 競爭已從 `dK/dV` 轉移；剩餘明顯競爭點為 `dQ` atomic
+- shared memory + 向量化存取可提升資料區域性與頻寬利用
+- 最近最大幅度的提速主要來自封裝層 overhead 降低（持久化配置 + 非同步傳輸）
 
 ---
 
@@ -156,9 +161,17 @@ CUDA 共享函式庫建置腳本：
 - 非法 shape / tile 的拒絕測試
 - forward-context helper 等價性
 
+### 4.6 `tests/test_flash_attention2_smoke.py`
+輕量快速檢查測試。
+
+涵蓋：
+- reference 路徑 finite/shape sanity
+- 小尺寸案例 CUDA 與 reference 對齊
+- CUDA 重複性 sanity
+
 ---
 
-### 4.6 `run_fa2_cuda_tests.slurm`
+### 4.7 `run_fa2_cuda_tests.slurm`
 PSC GPU 批次驗證腳本。
 
 流程：
@@ -221,23 +234,32 @@ PSC GPU 批次驗證腳本。
 ## 8) 最新 GPU 驗證結果（PSC）
 
 最新驗證工作：
-- Job ID：`37923696`
+- Job ID：`37945129`
 - 狀態：`COMPLETED`
 - ExitCode：`0:0`
-- Log：`fa2_cuda_test_37923696.log`
+- Log：`fa2_cuda_test_37945129.log`
 
 觀察結果：
 - FA2 backward 測試：`6 passed`
 - 額外 CUDA 路徑檢查：成功
 - 簡易時間量測（單次、含 Python/封裝層開銷）：
   - shape `(B=2,H=4,T=128,D=64)`
-  - `cuda_ms=2397.886`
-  - `ref_ms=2346.258`
-  - 速度比（`ref/cuda`）`= 0.98x`
+  - `cuda_ms=1.289`
+  - `ref_ms=2295.139`
+  - 速度比（`ref/cuda`）`= 1780.26x`
+
+額外快速比較（同 shape）：
+- Job ID：`37945237`
+- FA2 CUDA：`1.737 ms`
+- FA2 NumPy blocked：`2351.427 ms`
+- dense attention backward NumPy（非 FA）：`2.548 ms`
+- CUDA 相對 FA2 NumPy blocked：`1353.65x`
+- CUDA 相對 dense NumPy backward：`1.47x`
 
 解讀：
-- kernel 已改為 K/V-tile ownership，且 `dK/dV` 先在 shared memory 累積後再寫回，
-- 但端到端時間仍受封裝層 H2D/D2H copy 與 `dQ` atomic 成本影響。
+- 目前實作同時包含演算法層與系統層優化。
+- 最近最大提速來自移除每次呼叫的封裝層固定成本。
+- 在此工作負載下，CUDA FA2 明顯快於 NumPy 基準。
 
 ---
 
