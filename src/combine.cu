@@ -1,4 +1,7 @@
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <math_constants.h>
+#include <mma.h>
 #include <assert.h>
 #include <iostream>
 #include <sstream>
@@ -141,6 +144,67 @@ __device__ void broadcast_index(const int* big_index, const int* big_shape, cons
             out_index[i] = 0;
         }
     }
+}
+
+__device__ __forceinline__ float WarpDotTensorCore16(
+    const float* a,
+    const float* b,
+    int D,
+    half* warp_a_tile,
+    half* warp_b_tile,
+    float* warp_c_tile) {
+#if __CUDA_ARCH__ >= 700
+  using namespace nvcuda;
+  using namespace nvcuda::wmma;
+
+  int lane = threadIdx.x & 31;
+  float sum = 0.0f;
+
+  for (int d0 = 0; d0 < D; d0 += 16) {
+    // Build a tiny 16x16 x 16x16 MMA problem where only row 0 and col 0 are used,
+    // so C[0,0] equals the 16-element dot product.
+    for (int idx = lane; idx < 16 * 16; idx += 32) {
+      warp_a_tile[idx] = __float2half(0.0f);
+      warp_b_tile[idx] = __float2half(0.0f);
+    }
+    if (lane < 16) {
+      warp_a_tile[lane] = __float2half(a[d0 + lane]);         // A(0, lane)
+      warp_b_tile[lane * 16] = __float2half(b[d0 + lane]);    // B(lane, 0)
+    }
+    __syncwarp();
+
+    fragment<matrix_a, 16, 16, 16, half, row_major> a_frag;
+    fragment<matrix_b, 16, 16, 16, half, col_major> b_frag;
+    fragment<accumulator, 16, 16, 16, float> c_frag;
+    fill_fragment(c_frag, 0.0f);
+
+    load_matrix_sync(a_frag, warp_a_tile, 16);
+    load_matrix_sync(b_frag, warp_b_tile, 16);
+    mma_sync(c_frag, a_frag, b_frag, c_frag);
+    store_matrix_sync(warp_c_tile, c_frag, 16, mem_row_major);
+
+    if (lane == 0) {
+      sum += warp_c_tile[0];
+    }
+    __syncwarp();
+  }
+
+  // Broadcast lane0 result to the full warp.
+  sum = __shfl_sync(0xffffffff, sum, 0);
+  return sum;
+#else
+  int lane = threadIdx.x & 31;
+  float acc = 0.0f;
+  for (int d = lane; d < D; d += 32) {
+    acc += a[d] * b[d];
+  }
+  #pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    acc += __shfl_down_sync(0xffffffff, acc, offset);
+  }
+  acc = __shfl_sync(0xffffffff, acc, 0);
+  return acc;
+#endif
 }
 
 
@@ -472,7 +536,520 @@ __global__ void zipKernel(
 }
 
 
+__global__ void FlashAttention2BackwardKernel(
+  const float* __restrict__ dout,
+  const float* __restrict__ q,
+  const float* __restrict__ k,
+  const float* __restrict__ v,
+  const float* __restrict__ out,
+  const float* __restrict__ lse,
+  float* __restrict__ dq,
+  float* __restrict__ dk,
+  float* __restrict__ dv,
+    int B,
+    int H,
+    int T,
+    int D,
+    int BQ,
+    int BK,
+    int use_tensor_core,
+    int causal,
+    float softmax_scale)
+{
+  // Q-tile-owned 2D tiled FA2 backward mapping:
+  // - one block owns one (b,h,q_tile),
+  // - each warp owns one query row in that tile,
+  // - block loops across all K/V tiles and accumulates full dQ privately,
+  // - dQ has no global atomics; dK/dV are accumulated per K tile then atomically flushed.
+
+  int tile_id = blockIdx.x;
+  int num_q_tiles = (T + BQ - 1) / BQ;
+  int total_tiles = B * H * num_q_tiles;
+  if (tile_id >= total_tiles) {
+    return;
+  }
+
+  int tid = threadIdx.x;
+  int lane = tid & 31;
+  int warp_id = tid >> 5;
+
+  // Decode flattened tile index into (b,h,q_tile_idx).
+  int rem = tile_id;
+  int q_tile_idx = rem % num_q_tiles;
+  rem /= num_q_tiles;
+  int h = rem % H;
+  int b = rem / H;
+
+  int q0 = q_tile_idx * BQ;
+  int q_tile = min(BQ, T - q0);
+  int D_PAD = D + 1; // +1 padding helps avoid shared-memory bank conflicts when D is multiple of 32.
+
+  // Dynamic shared-memory layout.
+  extern __shared__ float smem[];
+
+  float* q_sh = smem;                                          // [BQ * D_PAD]
+  float* do_sh = q_sh + BQ * D_PAD;                           // [BQ * D_PAD]
+  float* out_sh = do_sh + BQ * D_PAD;                         // [BQ * D_PAD]
+  float* dq_acc = out_sh + BQ * D_PAD;                        // [BQ * D_PAD]
+  float* k_sh = dq_acc + BQ * D_PAD;                          // [BK * D_PAD]
+  float* v_sh = k_sh + BK * D_PAD;                            // [BK * D_PAD]
+  float* dk_acc = v_sh + BK * D_PAD;                          // [BK * D_PAD]
+  float* dv_acc = dk_acc + BK * D_PAD;                        // [BK * D_PAD]
+  float* Drow_sh = dv_acc + BK * D_PAD;                       // [BQ]
+  float* p_sh = Drow_sh + BQ;                                 // [BQ]
+  float* dS_sh = p_sh + BQ;                                   // [BQ]
+  float* lse_sh = dS_sh + BQ;                                 // [BQ]
+
+  int warps_per_block = blockDim.x / 32;
+  half* tc_a_sh = reinterpret_cast<half*>(lse_sh + BQ);       // [warps][16*16] (optional)
+  half* tc_b_sh = tc_a_sh + warps_per_block * 16 * 16;        // [warps][16*16] (optional)
+  float* tc_c_sh = reinterpret_cast<float*>(tc_b_sh + warps_per_block * 16 * 16); // [warps][16*16] (optional)
+
+  // Load this block's Q/dO/out tile once.
+  // Use vectorized global reads when D is 4-aligned.
+  if ((D & 3) == 0) {
+    int D4 = D >> 2;
+    for (int qi = 0; qi < q_tile; ++qi) {
+      int row4 = ((b * H + h) * T + (q0 + qi)) * D;
+      const float4* q4 = reinterpret_cast<const float4*>(q + row4);
+      const float4* do4 = reinterpret_cast<const float4*>(dout + row4);
+      const float4* out4 = reinterpret_cast<const float4*>(out + row4);
+      for (int v4i = tid; v4i < D4; v4i += blockDim.x) {
+        float4 qv = q4[v4i];
+        float4 dov = do4[v4i];
+        float4 ov = out4[v4i];
+        int d = v4i << 2;
+        q_sh[qi * D_PAD + d + 0] = qv.x;
+        q_sh[qi * D_PAD + d + 1] = qv.y;
+        q_sh[qi * D_PAD + d + 2] = qv.z;
+        q_sh[qi * D_PAD + d + 3] = qv.w;
+        do_sh[qi * D_PAD + d + 0] = dov.x;
+        do_sh[qi * D_PAD + d + 1] = dov.y;
+        do_sh[qi * D_PAD + d + 2] = dov.z;
+        do_sh[qi * D_PAD + d + 3] = dov.w;
+        out_sh[qi * D_PAD + d + 0] = ov.x;
+        out_sh[qi * D_PAD + d + 1] = ov.y;
+        out_sh[qi * D_PAD + d + 2] = ov.z;
+        out_sh[qi * D_PAD + d + 3] = ov.w;
+      }
+    }
+  } else {
+    for (int linear = tid; linear < q_tile * D; linear += blockDim.x) {
+      int qi = linear / D;
+      int d = linear % D;
+      int row4 = ((b * H + h) * T + (q0 + qi)) * D;
+      q_sh[qi * D_PAD + d] = q[row4 + d];
+      do_sh[qi * D_PAD + d] = dout[row4 + d];
+      out_sh[qi * D_PAD + d] = out[row4 + d];
+    }
+  }
+
+  // Initialize query-tile dQ accumulators in shared memory.
+  for (int linear = tid; linear < q_tile * D_PAD; linear += blockDim.x) {
+    int d = linear % D_PAD;
+    if (d < D) {
+      dq_acc[linear] = 0.0f;
+    }
+  }
+  __syncthreads();
+
+  // Each warp owns one query row in the Q tile.
+  if (warp_id < q_tile) {
+    int i = q0 + warp_id;
+
+    if (lane == 0) {
+      int row3 = ((b * H + h) * T + i);
+      lse_sh[warp_id] = lse[row3];
+    }
+
+    // Warp-level D_i = dot(dO_i, O_i) reduction.
+    float part_D = 0.0f;
+    for (int d = lane; d < D; d += 32) {
+      part_D += do_sh[warp_id * D_PAD + d] * out_sh[warp_id * D_PAD + d];
+    }
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      part_D += __shfl_down_sync(0xffffffff, part_D, offset);
+    }
+    if (lane == 0) {
+      Drow_sh[warp_id] = part_D;
+    }
+  }
+  __syncthreads();
+
+  // Loop over all K/V tiles for this Q tile.
+  for (int k0 = 0; k0 < T; k0 += BK) {
+    if (causal) {
+      int q_max = q0 + q_tile - 1;
+      if (k0 > q_max) {
+        break;
+      }
+    }
+
+    int k_tile = min(BK, T - k0);
+
+    // Load this K/V tile.
+    if ((D & 3) == 0) {
+      int D4 = D >> 2;
+      for (int tj = 0; tj < k_tile; ++tj) {
+        int col4 = ((b * H + h) * T + (k0 + tj)) * D;
+        const float4* k4 = reinterpret_cast<const float4*>(k + col4);
+        const float4* v4 = reinterpret_cast<const float4*>(v + col4);
+        for (int v4i = tid; v4i < D4; v4i += blockDim.x) {
+          float4 kv = k4[v4i];
+          float4 vv = v4[v4i];
+          int d = v4i << 2;
+          k_sh[tj * D_PAD + d + 0] = kv.x;
+          k_sh[tj * D_PAD + d + 1] = kv.y;
+          k_sh[tj * D_PAD + d + 2] = kv.z;
+          k_sh[tj * D_PAD + d + 3] = kv.w;
+          v_sh[tj * D_PAD + d + 0] = vv.x;
+          v_sh[tj * D_PAD + d + 1] = vv.y;
+          v_sh[tj * D_PAD + d + 2] = vv.z;
+          v_sh[tj * D_PAD + d + 3] = vv.w;
+        }
+      }
+    } else {
+      for (int linear = tid; linear < k_tile * D; linear += blockDim.x) {
+        int tj = linear / D;
+        int d = linear % D;
+        int col4 = ((b * H + h) * T + (k0 + tj)) * D;
+        k_sh[tj * D_PAD + d] = k[col4 + d];
+        v_sh[tj * D_PAD + d] = v[col4 + d];
+      }
+    }
+
+    // Reset tile-local dK/dV accumulators.
+    for (int linear = tid; linear < k_tile * D_PAD; linear += blockDim.x) {
+      int d = linear % D_PAD;
+      if (d < D) {
+        dk_acc[linear] = 0.0f;
+        dv_acc[linear] = 0.0f;
+      }
+    }
+    __syncthreads();
+
+    // For each column inside this K tile, compute p/dS for each query row.
+    for (int tj = 0; tj < k_tile; ++tj) {
+      if (warp_id < q_tile) {
+        int j = k0 + tj;
+        int i = q0 + warp_id;
+
+        float p = 0.0f;
+        float dS = 0.0f;
+        if (!causal || j <= i) {
+          float part_score = 0.0f;
+          float part_dP = 0.0f;
+
+          const float* q_row = &q_sh[warp_id * D_PAD];
+          const float* do_row = &do_sh[warp_id * D_PAD];
+          const float* k_row = &k_sh[tj * D_PAD];
+          const float* v_row = &v_sh[tj * D_PAD];
+
+          bool use_tc = (use_tensor_core != 0) && ((D & 15) == 0);
+          if (use_tc) {
+            half* warp_a_tile = tc_a_sh + warp_id * 16 * 16;
+            half* warp_b_tile = tc_b_sh + warp_id * 16 * 16;
+            float* warp_c_tile = tc_c_sh + warp_id * 16 * 16;
+
+            part_score = WarpDotTensorCore16(q_row, k_row, D, warp_a_tile, warp_b_tile, warp_c_tile);
+            part_dP = WarpDotTensorCore16(do_row, v_row, D, warp_a_tile, warp_b_tile, warp_c_tile);
+          } else {
+            for (int d = lane; d < D; d += 32) {
+              part_score += q_row[d] * k_row[d];
+              part_dP += do_row[d] * v_row[d];
+            }
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1) {
+              part_score += __shfl_down_sync(0xffffffff, part_score, offset);
+              part_dP += __shfl_down_sync(0xffffffff, part_dP, offset);
+            }
+          }
+
+          if (lane == 0) {
+            float score = part_score * softmax_scale;
+            p = expf(score - lse_sh[warp_id]);
+            dS = p * (part_dP - Drow_sh[warp_id]);
+            p_sh[warp_id] = p;
+            dS_sh[warp_id] = dS;
+          }
+        } else if (lane == 0) {
+          p_sh[warp_id] = 0.0f;
+          dS_sh[warp_id] = 0.0f;
+        }
+      }
+      __syncthreads();
+
+      // dQ shared accumulation: one warp per query row.
+      if (warp_id < q_tile) {
+        float dS = dS_sh[warp_id];
+        for (int d = lane; d < D; d += 32) {
+          float kv = k_sh[tj * D_PAD + d];
+          dq_acc[warp_id * D_PAD + d] += dS * kv * softmax_scale;
+        }
+      }
+
+      // dK/dV register accumulation across Q rows, then shared accumulation.
+      for (int d = tid; d < D; d += blockDim.x) {
+        float dk_sum = 0.0f;
+        float dv_sum = 0.0f;
+        for (int qi = 0; qi < q_tile; ++qi) {
+          dk_sum += dS_sh[qi] * q_sh[qi * D_PAD + d] * softmax_scale;
+          dv_sum += p_sh[qi] * do_sh[qi * D_PAD + d];
+        }
+        dk_acc[tj * D_PAD + d] += dk_sum;
+        dv_acc[tj * D_PAD + d] += dv_sum;
+      }
+      __syncthreads();
+    }
+
+    // Flush this K/V-tile dK/dV (global atomic across Q tiles).
+    for (int linear = tid; linear < k_tile * D; linear += blockDim.x) {
+      int tj = linear / D;
+      int d = linear % D;
+      int col4 = ((b * H + h) * T + (k0 + tj)) * D;
+      atomicAdd(&dk[col4 + d], dk_acc[tj * D_PAD + d]);
+      atomicAdd(&dv[col4 + d], dv_acc[tj * D_PAD + d]);
+    }
+    __syncthreads();
+  }
+
+  // Flush full query-tile dQ once to global (no atomics needed: unique owner block).
+  if ((D & 3) == 0) {
+    int D4 = D >> 2;
+    for (int qi = 0; qi < q_tile; ++qi) {
+      int row4 = ((b * H + h) * T + (q0 + qi)) * D;
+      float4* dq4 = reinterpret_cast<float4*>(dq + row4);
+      for (int v4i = tid; v4i < D4; v4i += blockDim.x) {
+        int d = v4i << 2;
+        float4 outv;
+        outv.x = dq_acc[qi * D_PAD + d + 0];
+        outv.y = dq_acc[qi * D_PAD + d + 1];
+        outv.z = dq_acc[qi * D_PAD + d + 2];
+        outv.w = dq_acc[qi * D_PAD + d + 3];
+        dq4[v4i] = outv;
+      }
+    }
+  } else {
+    for (int linear = tid; linear < q_tile * D; linear += blockDim.x) {
+      int qi = linear / D;
+      int d = linear % D;
+      int row4 = ((b * H + h) * T + (q0 + qi)) * D;
+      dq[row4 + d] = dq_acc[qi * D_PAD + d];
+    }
+  }
+}
+
+
 extern "C" {
+
+// Persistent CUDA buffers for FA2 backward wrapper.
+// This avoids cudaMalloc/cudaFree on every Python call, which is expensive
+// and can dominate end-to-end timing for moderate sequence lengths.
+static float* g_fa2_dout = nullptr;
+static float* g_fa2_q = nullptr;
+static float* g_fa2_k = nullptr;
+static float* g_fa2_v = nullptr;
+static float* g_fa2_out = nullptr;
+static float* g_fa2_lse = nullptr;
+static float* g_fa2_dq = nullptr;
+static float* g_fa2_dk = nullptr;
+static float* g_fa2_dv = nullptr;
+static size_t g_fa2_cap4 = 0;
+static size_t g_fa2_cap3 = 0;
+static int g_fa2_device = -1;
+
+static void FreeFA2Buffers() {
+  if (g_fa2_dout) cudaFree(g_fa2_dout);
+  if (g_fa2_q) cudaFree(g_fa2_q);
+  if (g_fa2_k) cudaFree(g_fa2_k);
+  if (g_fa2_v) cudaFree(g_fa2_v);
+  if (g_fa2_out) cudaFree(g_fa2_out);
+  if (g_fa2_lse) cudaFree(g_fa2_lse);
+  if (g_fa2_dq) cudaFree(g_fa2_dq);
+  if (g_fa2_dk) cudaFree(g_fa2_dk);
+  if (g_fa2_dv) cudaFree(g_fa2_dv);
+
+  g_fa2_dout = nullptr;
+  g_fa2_q = nullptr;
+  g_fa2_k = nullptr;
+  g_fa2_v = nullptr;
+  g_fa2_out = nullptr;
+  g_fa2_lse = nullptr;
+  g_fa2_dq = nullptr;
+  g_fa2_dk = nullptr;
+  g_fa2_dv = nullptr;
+  g_fa2_cap4 = 0;
+  g_fa2_cap3 = 0;
+  g_fa2_device = -1;
+}
+
+void FlashAttention2Backward(
+    float* dout,
+    float* q,
+    float* k,
+    float* v,
+    float* out,
+    float* lse,
+    float* dq,
+    float* dk,
+    float* dv,
+    int B,
+    int H,
+    int T,
+    int D,
+    int causal,
+    float softmax_scale) {
+    // Host-side C ABI wrapper called from Python ctypes.
+    // Performs:
+    //   1) H2D copies,
+    //   2) kernel launch,
+    //   3) D2H copies,
+    //   4) cleanup.
+    size_t size4 = (size_t)B * H * T * D;
+    size_t size3 = (size_t)B * H * T;
+
+    // Ensure buffers belong to active device; reallocate if device changed.
+    int device = 0;
+    cudaGetDevice(&device);
+    if (g_fa2_device != -1 && g_fa2_device != device) {
+      FreeFA2Buffers();
+    }
+
+    // Grow-on-demand allocation strategy.
+    if (size4 > g_fa2_cap4 || size3 > g_fa2_cap3 || g_fa2_dout == nullptr) {
+      FreeFA2Buffers();
+
+      cudaMalloc(&g_fa2_dout, size4 * sizeof(float));
+      cudaMalloc(&g_fa2_q, size4 * sizeof(float));
+      cudaMalloc(&g_fa2_k, size4 * sizeof(float));
+      cudaMalloc(&g_fa2_v, size4 * sizeof(float));
+      cudaMalloc(&g_fa2_out, size4 * sizeof(float));
+      cudaMalloc(&g_fa2_lse, size3 * sizeof(float));
+      cudaMalloc(&g_fa2_dq, size4 * sizeof(float));
+      cudaMalloc(&g_fa2_dk, size4 * sizeof(float));
+      cudaMalloc(&g_fa2_dv, size4 * sizeof(float));
+
+      g_fa2_cap4 = size4;
+      g_fa2_cap3 = size3;
+      g_fa2_device = device;
+    }
+
+    float *d_dout = g_fa2_dout, *d_q = g_fa2_q, *d_k = g_fa2_k, *d_v = g_fa2_v;
+    float *d_out = g_fa2_out, *d_lse = g_fa2_lse;
+    float *d_dq = g_fa2_dq, *d_dk = g_fa2_dk, *d_dv = g_fa2_dv;
+
+    cudaStream_t stream = 0;
+
+    // Copy host tensors to device.
+    cudaMemcpyAsync(d_dout, dout, size4 * sizeof(float), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(d_q, q, size4 * sizeof(float), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(d_k, k, size4 * sizeof(float), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(d_v, v, size4 * sizeof(float), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(d_out, out, size4 * sizeof(float), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(d_lse, lse, size3 * sizeof(float), cudaMemcpyHostToDevice, stream);
+
+    // Zero output gradient buffers before accumulation in kernel.
+    cudaMemsetAsync(d_dq, 0, size4 * sizeof(float), stream);
+    cudaMemsetAsync(d_dk, 0, size4 * sizeof(float), stream);
+    cudaMemsetAsync(d_dv, 0, size4 * sizeof(float), stream);
+
+    // Architecture-aware 2D tiling parameters (Q tile x K tile).
+    // - sm80+ (Ampere/Hopper): prefer larger BK for better reuse.
+    // - sm70/75 (Volta/Turing): keep BK moderate to balance occupancy/shared memory.
+    // - legacy: conservative defaults.
+    cudaDeviceProp prop;
+    cudaGetDeviceProperties(&prop, device);
+
+    int BQ = (D <= 64) ? 8 : 4;   // warps per block (one warp per query row)
+    int BK = (D <= 64) ? 32 : 16; // default K/V tile size
+
+    if (prop.major >= 8) {
+      BK = (D <= 64) ? 64 : 32;
+    } else if (prop.major == 7) {
+      BK = (D <= 64) ? 32 : 16;
+    } else {
+      BK = (D <= 64) ? 16 : 8;
+      BQ = (D <= 64) ? 4 : 2;
+    }
+
+    int threadsPerBlock = BQ * 32;
+    if (threadsPerBlock > 256) {
+      threadsPerBlock = 256;
+    }
+
+    int num_q_tiles = (T + BQ - 1) / BQ;
+    int blocksPerGrid = B * H * num_q_tiles;
+
+    int D_PAD = D + 1;
+    size_t sharedFloats = (size_t)(4 * BQ * D_PAD + 4 * BK * D_PAD + 4 * BQ);
+    size_t baseSharedBytes = sharedFloats * sizeof(float);
+
+    // Tensor-core scratch is optional. On V100 (sm70), this WMMA micro-path
+    // may reduce occupancy due to extra shared memory and can be slower than
+    // scalar/shuffle dots in this kernel structure.
+    int use_tensor_core = 0;
+    if (prop.major >= 7 && (D % 16 == 0) && D >= 128) {
+      use_tensor_core = 1;
+    }
+
+    size_t tcSharedBytes = 0;
+    if (use_tensor_core) {
+      int warpsPerBlock = threadsPerBlock / 32;
+      tcSharedBytes =
+        (size_t)warpsPerBlock * (16 * 16 * sizeof(half)) +
+        (size_t)warpsPerBlock * (16 * 16 * sizeof(half)) +
+        (size_t)warpsPerBlock * (16 * 16 * sizeof(float));
+    }
+    size_t sharedBytes = baseSharedBytes + tcSharedBytes;
+
+    // Request larger dynamic shared-memory carveout when needed.
+    cudaFuncSetAttribute(
+        FlashAttention2BackwardKernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        (int)sharedBytes);
+
+    FlashAttention2BackwardKernel<<<blocksPerGrid, threadsPerBlock, sharedBytes, stream>>>(
+        d_dout,
+        d_q,
+        d_k,
+        d_v,
+        d_out,
+        d_lse,
+        d_dq,
+        d_dk,
+        d_dv,
+        B,
+        H,
+        T,
+        D,
+        BQ,
+        BK,
+        use_tensor_core,
+        causal,
+        softmax_scale);
+
+    // Surface launch errors early.
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+      fprintf(stderr, "FlashAttention2Backward Error: %s\n", cudaGetErrorString(err));
+      exit(EXIT_FAILURE);
+    }
+
+    // Copy gradients back to host buffers expected by ctypes caller.
+    cudaMemcpyAsync(dq, d_dq, size4 * sizeof(float), cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(dk, d_dk, size4 * sizeof(float), cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(dv, d_dv, size4 * sizeof(float), cudaMemcpyDeviceToHost, stream);
+
+    // One sync for kernel + all copies.
+    cudaStreamSynchronize(stream);
+
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+      fprintf(stderr, "FlashAttention2Backward Runtime Error: %s\n", cudaGetErrorString(err));
+      exit(EXIT_FAILURE);
+    }
+}
 
 void MatrixMultiply(
     float* out,
@@ -740,5 +1317,441 @@ void tensorReduce(
     cudaFree(d_a_shape);
     cudaFree(d_a_strides);
 }
+
+// ------------------------------
+// FlashAttention-2 Forward
+// ------------------------------
+
+__global__ void FlashAttention2ForwardKernel(
+    const float* __restrict__ q,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    float* __restrict__ out,
+    float* __restrict__ lse,
+    int B,
+    int H,
+    int T,
+    int D,
+    int BQ,
+    int BK,
+    int use_tensor_core,
+    int causal,
+    float softmax_scale)
+{
+  // Mapping mirrors the backward kernel:
+  // - one block owns one (b,h,q_tile)
+  // - one warp owns one query row in that tile
+  // - the block streams across all K/V tiles
+  // - each warp maintains online-softmax state for its row
+
+  int tile_id = blockIdx.x;
+  int num_q_tiles = (T + BQ - 1) / BQ;
+  int total_tiles = B * H * num_q_tiles;
+  if (tile_id >= total_tiles) {
+    return;
+  }
+
+  int tid = threadIdx.x;
+  int lane = tid & 31;
+  int warp_id = tid >> 5;
+
+  // Decode flattened tile index into (b,h,q_tile_idx)
+  int rem = tile_id;
+  int q_tile_idx = rem % num_q_tiles;
+  rem /= num_q_tiles;
+  int h = rem % H;
+  int b = rem / H;
+
+  int q0 = q_tile_idx * BQ;
+  int q_tile = min(BQ, T - q0);
+  int D_PAD = D + 1;  // same padding trick as backward to reduce bank conflicts
+
+  // Dynamic shared-memory layout.
+  // q_sh   : [BQ * D_PAD]
+  // k_sh   : [BK * D_PAD]
+  // v_sh   : [BK * D_PAD]
+  // score_sh : [BQ * BK]  (tile-local scores per query row)
+  // tc scratch optional after that
+  extern __shared__ unsigned char smem_raw[];
+  float* smem = reinterpret_cast<float*>(smem_raw);
+
+  float* q_sh = smem;                              // [BQ * D_PAD]
+  float* k_sh = q_sh + BQ * D_PAD;                // [BK * D_PAD]
+  float* v_sh = k_sh + BK * D_PAD;                // [BK * D_PAD]
+  float* score_sh = v_sh + BK * D_PAD;            // [BQ * BK]
+
+  int warps_per_block = blockDim.x / 32;
+  half* tc_a_sh = reinterpret_cast<half*>(score_sh + BQ * BK);  // [warps][16*16]
+  half* tc_b_sh = tc_a_sh + warps_per_block * 16 * 16;          // [warps][16*16]
+  float* tc_c_sh = reinterpret_cast<float*>(tc_b_sh + warps_per_block * 16 * 16); // [warps][16*16]
+
+  // Load this block's Q tile once.
+  if ((D & 3) == 0) {
+    int D4 = D >> 2;
+    for (int qi = 0; qi < q_tile; ++qi) {
+      int row = ((b * H + h) * T + (q0 + qi)) * D;
+      const float4* q4 = reinterpret_cast<const float4*>(q + row);
+      for (int v4i = tid; v4i < D4; v4i += blockDim.x) {
+        float4 qv = q4[v4i];
+        int d = v4i << 2;
+        q_sh[qi * D_PAD + d + 0] = qv.x;
+        q_sh[qi * D_PAD + d + 1] = qv.y;
+        q_sh[qi * D_PAD + d + 2] = qv.z;
+        q_sh[qi * D_PAD + d + 3] = qv.w;
+      }
+    }
+  } else {
+    for (int linear = tid; linear < q_tile * D; linear += blockDim.x) {
+      int qi = linear / D;
+      int d = linear % D;
+      int row = ((b * H + h) * T + (q0 + qi)) * D;
+      q_sh[qi * D_PAD + d] = q[row + d];
+    }
+  }
+  __syncthreads();
+
+  // Each warp owns one query row.
+  if (warp_id >= q_tile) {
+    return;
+  }
+
+  int i = q0 + warp_id;
+  const float* q_row = &q_sh[warp_id * D_PAD];
+
+  // Online-softmax running state for this row.
+  float m_i = -CUDART_INF_F;
+  float l_i = 0.0f;
+
+  // Each lane owns d = lane, lane+32, ...
+  // Keep running output accumulator in registers.
+
+  // We need one register accumulator per lane-owned output dimension.
+  // Since C++ does not allow variable-length local arrays portably here, we compute/store directly
+  // by iterating over d in the same pattern each time and keeping the current value in global out
+  // only at the end via a second register pass. So we use a small stack buffer with a safe upper bound.
+  // If you know D <= 256, this is fine. Otherwise raise MAX_HEAD_DIM_CHUNKS.
+  constexpr int MAX_HEAD_DIM_CHUNKS = 32; // supports D up to 32*32 = 1024
+  float acc_chunks[MAX_HEAD_DIM_CHUNKS];
+
+  int num_chunks = (D + 31) / 32;
+  if (num_chunks > MAX_HEAD_DIM_CHUNKS) {
+    return; // safeguard; adjust constant if you need larger D
+  }
+  #pragma unroll
+  for (int c = 0; c < MAX_HEAD_DIM_CHUNKS; ++c) {
+    if (c < num_chunks) acc_chunks[c] = 0.0f;
+  }
+
+  // Stream over K/V tiles.
+  for (int k0 = 0; k0 < T; k0 += BK) {
+    if (causal) {
+      if (k0 > i) {
+        break;
+      }
+    }
+
+    int k_tile = min(BK, T - k0);
+
+    // Load K/V tile into shared.
+    if ((D & 3) == 0) {
+      int D4 = D >> 2;
+      for (int tj = 0; tj < k_tile; ++tj) {
+        int row = ((b * H + h) * T + (k0 + tj)) * D;
+        const float4* k4 = reinterpret_cast<const float4*>(k + row);
+        const float4* v4 = reinterpret_cast<const float4*>(v + row);
+        for (int v4i = tid; v4i < D4; v4i += blockDim.x) {
+          float4 kv = k4[v4i];
+          float4 vv = v4[v4i];
+          int d = v4i << 2;
+          k_sh[tj * D_PAD + d + 0] = kv.x;
+          k_sh[tj * D_PAD + d + 1] = kv.y;
+          k_sh[tj * D_PAD + d + 2] = kv.z;
+          k_sh[tj * D_PAD + d + 3] = kv.w;
+          v_sh[tj * D_PAD + d + 0] = vv.x;
+          v_sh[tj * D_PAD + d + 1] = vv.y;
+          v_sh[tj * D_PAD + d + 2] = vv.z;
+          v_sh[tj * D_PAD + d + 3] = vv.w;
+        }
+      }
+    } else {
+      for (int linear = tid; linear < k_tile * D; linear += blockDim.x) {
+        int tj = linear / D;
+        int d = linear % D;
+        int row = ((b * H + h) * T + (k0 + tj)) * D;
+        k_sh[tj * D_PAD + d] = k[row + d];
+        v_sh[tj * D_PAD + d] = v[row + d];
+      }
+    }
+    __syncthreads();
+
+    // 1) compute tile scores S_ij and store them in shared
+    float tile_row_max = -CUDART_INF_F;
+
+    for (int tj = 0; tj < k_tile; ++tj) {
+      int j = k0 + tj;
+      float score = -CUDART_INF_F;
+
+      if (!causal || j <= i) {
+        const float* k_row = &k_sh[tj * D_PAD];
+
+        float part_score = 0.0f;
+        bool use_tc = (use_tensor_core != 0) && ((D & 15) == 0);
+
+        if (use_tc) {
+          half* warp_a_tile = tc_a_sh + warp_id * 16 * 16;
+          half* warp_b_tile = tc_b_sh + warp_id * 16 * 16;
+          float* warp_c_tile = tc_c_sh + warp_id * 16 * 16;
+          part_score = WarpDotTensorCore16(q_row, k_row, D, warp_a_tile, warp_b_tile, warp_c_tile);
+        } else {
+          for (int d = lane; d < D; d += 32) {
+            part_score += q_row[d] * k_row[d];
+          }
+          #pragma unroll
+          for (int offset = 16; offset > 0; offset >>= 1) {
+            part_score += __shfl_down_sync(0xffffffff, part_score, offset);
+          }
+          part_score = __shfl_sync(0xffffffff, part_score, 0);
+        }
+
+        if (lane == 0) {
+          score = part_score * softmax_scale;
+          score_sh[warp_id * BK + tj] = score;
+          tile_row_max = fmaxf(tile_row_max, score);
+        }
+      } else if (lane == 0) {
+        score_sh[warp_id * BK + tj] = -CUDART_INF_F;
+      }
+    }
+
+    // Broadcast tile_row_max from lane 0
+    tile_row_max = __shfl_sync(0xffffffff, tile_row_max, 0);
+
+    // 2) compute tile-local exp sum and weighted V accumulation
+    float tile_l = 0.0f;
+
+    // one temporary per chunk
+    float tile_acc_chunks[MAX_HEAD_DIM_CHUNKS];
+    #pragma unroll
+    for (int c = 0; c < MAX_HEAD_DIM_CHUNKS; ++c) {
+      if (c < num_chunks) tile_acc_chunks[c] = 0.0f;
+    }
+
+    for (int tj = 0; tj < k_tile; ++tj) {
+      float p = 0.0f;
+      if (lane == 0) {
+        float score = score_sh[warp_id * BK + tj];
+        p = (score == -CUDART_INF_F) ? 0.0f : expf(score - tile_row_max);
+      }
+      p = __shfl_sync(0xffffffff, p, 0);
+
+      if (lane == 0) {
+        tile_l += p;
+      }
+
+      const float* v_row = &v_sh[tj * D_PAD];
+      for (int c = 0; c < num_chunks; ++c) {
+        int d = c * 32 + lane;
+        if (d < D) {
+          tile_acc_chunks[c] += p * v_row[d];
+        }
+      }
+    }
+
+    tile_l = __shfl_sync(0xffffffff, tile_l, 0);
+
+    // 3) merge this tile with running online-softmax state
+    float m_new = fmaxf(m_i, tile_row_max);
+    float alpha = (m_i == -CUDART_INF_F) ? 0.0f : expf(m_i - m_new);
+    float beta = (tile_row_max == -CUDART_INF_F) ? 0.0f : expf(tile_row_max - m_new);
+    float l_new = alpha * l_i + beta * tile_l;
+
+    float old_scale = (l_new > 0.0f) ? (alpha * l_i / l_new) : 0.0f;
+    float new_scale = (l_new > 0.0f) ? (beta / l_new) : 0.0f;
+
+    for (int c = 0; c < num_chunks; ++c) {
+      acc_chunks[c] = old_scale * acc_chunks[c] + new_scale * tile_acc_chunks[c];
+    }
+
+    m_i = m_new;
+    l_i = l_new;
+    __syncthreads();
+  }
+
+  // Write final output row
+  int row = ((b * H + h) * T + i) * D;
+  for (int c = 0; c < num_chunks; ++c) {
+    int d = c * 32 + lane;
+    if (d < D) {
+      out[row + d] = acc_chunks[c];
+    }
+  }
+
+  if (lane == 0) {
+    int row3 = ((b * H + h) * T + i);
+    lse[row3] = m_i + logf(l_i);
+  }
+}
+
+
+// ------------------------------
+// Persistent CUDA buffers for FA2 forward wrapper
+// ------------------------------
+extern "C" {
+
+static float* g_fa2f_q = nullptr;
+static float* g_fa2f_k = nullptr;
+static float* g_fa2f_v = nullptr;
+static float* g_fa2f_out = nullptr;
+static float* g_fa2f_lse = nullptr;
+static size_t g_fa2f_cap4 = 0; // capacity for [B,H,T,D]
+static size_t g_fa2f_cap3 = 0; // capacity for [B,H,T]
+static int g_fa2f_device = -1;
+
+static void FreeFA2ForwardBuffers() {
+  if (g_fa2f_q) cudaFree(g_fa2f_q);
+  if (g_fa2f_k) cudaFree(g_fa2f_k);
+  if (g_fa2f_v) cudaFree(g_fa2f_v);
+  if (g_fa2f_out) cudaFree(g_fa2f_out);
+  if (g_fa2f_lse) cudaFree(g_fa2f_lse);
+
+  g_fa2f_q = nullptr;
+  g_fa2f_k = nullptr;
+  g_fa2f_v = nullptr;
+  g_fa2f_out = nullptr;
+  g_fa2f_lse = nullptr;
+  g_fa2f_cap4 = 0;
+  g_fa2f_cap3 = 0;
+  g_fa2f_device = -1;
+}
+
+void FlashAttention2Forward(
+    float* q,
+    float* k,
+    float* v,
+    float* out,
+    float* lse,
+    int B,
+    int H,
+    int T,
+    int D,
+    int causal,
+    float softmax_scale) {
+  // Host-side C ABI wrapper called from Python ctypes.
+
+  int device = 0;
+  cudaGetDevice(&device);
+
+  // If device changed, drop old cached buffers.
+  if (g_fa2f_device != -1 && g_fa2f_device != device) {
+    FreeFA2ForwardBuffers();
+  }
+  g_fa2f_device = device;
+
+  size_t elems4 = (size_t)B * H * T * D; // q/k/v/out
+  size_t elems3 = (size_t)B * H * T;     // lse
+
+  if (elems4 > g_fa2f_cap4) {
+    if (g_fa2f_q) cudaFree(g_fa2f_q);
+    if (g_fa2f_k) cudaFree(g_fa2f_k);
+    if (g_fa2f_v) cudaFree(g_fa2f_v);
+    if (g_fa2f_out) cudaFree(g_fa2f_out);
+
+    cudaMalloc(&g_fa2f_q, elems4 * sizeof(float));
+    cudaMalloc(&g_fa2f_k, elems4 * sizeof(float));
+    cudaMalloc(&g_fa2f_v, elems4 * sizeof(float));
+    cudaMalloc(&g_fa2f_out, elems4 * sizeof(float));
+    g_fa2f_cap4 = elems4;
+  }
+
+  if (elems3 > g_fa2f_cap3) {
+    if (g_fa2f_lse) cudaFree(g_fa2f_lse);
+    cudaMalloc(&g_fa2f_lse, elems3 * sizeof(float));
+    g_fa2f_cap3 = elems3;
+  }
+
+  cudaStream_t stream = 0; // default stream
+
+  cudaMemcpyAsync(g_fa2f_q, q, elems4 * sizeof(float), cudaMemcpyHostToDevice, stream);
+  cudaMemcpyAsync(g_fa2f_k, k, elems4 * sizeof(float), cudaMemcpyHostToDevice, stream);
+  cudaMemcpyAsync(g_fa2f_v, v, elems4 * sizeof(float), cudaMemcpyHostToDevice, stream);
+
+  // Match the backward wrapper's launch heuristic.
+  cudaDeviceProp prop;
+  cudaGetDeviceProperties(&prop, device);
+
+  int BQ = (D <= 64) ? 8 : 4;
+  int BK = (D <= 64) ? 32 : 16;
+
+  if (prop.major >= 8) {
+    BK = (D <= 64) ? 64 : 32;
+  } else if (prop.major == 7) {
+    BK = (D <= 64) ? 32 : 16;
+  } else {
+    BK = (D <= 64) ? 16 : 8;
+    BQ = (D <= 64) ? 4 : 2;
+  }
+
+  int threadsPerBlock = BQ * 32;
+  if (threadsPerBlock > 256) {
+    threadsPerBlock = 256;
+  }
+
+  int num_q_tiles = (T + BQ - 1) / BQ;
+  int blocksPerGrid = B * H * num_q_tiles;
+
+  int D_PAD = D + 1;
+  size_t baseSharedBytes =
+      (size_t)(BQ * D_PAD + BK * D_PAD + BK * D_PAD + BQ * BK) * sizeof(float);
+
+  int use_tensor_core = 0;
+  if (prop.major >= 7 && (D % 16 == 0) && D >= 128) {
+    use_tensor_core = 1;
+  }
+
+  size_t tcSharedBytes = 0;
+  if (use_tensor_core) {
+    int warpsPerBlock = threadsPerBlock / 32;
+    tcSharedBytes =
+        (size_t)warpsPerBlock * (16 * 16 * sizeof(half)) +
+        (size_t)warpsPerBlock * (16 * 16 * sizeof(half)) +
+        (size_t)warpsPerBlock * (16 * 16 * sizeof(float));
+  }
+
+  size_t sharedBytes = baseSharedBytes + tcSharedBytes;
+
+  cudaFuncSetAttribute(
+      FlashAttention2ForwardKernel,
+      cudaFuncAttributeMaxDynamicSharedMemorySize,
+      (int)sharedBytes);
+
+  FlashAttention2ForwardKernel<<<blocksPerGrid, threadsPerBlock, sharedBytes, stream>>>(
+      g_fa2f_q,
+      g_fa2f_k,
+      g_fa2f_v,
+      g_fa2f_out,
+      g_fa2f_lse,
+      B,
+      H,
+      T,
+      D,
+      BQ,
+      BK,
+      use_tensor_core,
+      causal,
+      softmax_scale);
+
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    fprintf(stderr, "FlashAttention2Forward Error: %s\n", cudaGetErrorString(err));
+    exit(EXIT_FAILURE);
+  }
+
+  cudaMemcpyAsync(out, g_fa2f_out, elems4 * sizeof(float), cudaMemcpyDeviceToHost, stream);
+  cudaMemcpyAsync(lse, g_fa2f_lse, elems3 * sizeof(float), cudaMemcpyDeviceToHost, stream);
+
+  cudaStreamSynchronize(stream);
+}
+
+} // extern "C"
 
 }

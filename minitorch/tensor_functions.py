@@ -421,6 +421,73 @@ class MatMul(Function):
             grad_output.f.matrix_multiply(transpose(t1), grad_output),
         )
 
+def flash_attention(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    causal: bool = False,
+    softmax_scale: float = None,
+) -> Tensor:
+    if softmax_scale is None:
+        softmax_scale = 1.0 / np.sqrt(q.shape[-1])
+
+    causal_t = tensor([1 if causal else 0], backend=q.backend)
+    scale_t = tensor([softmax_scale], backend=q.backend)
+    return FlashAttention.apply(q, k, v, causal_t, scale_t)
+    
+class FlashAttention(Function):
+    @staticmethod
+    def forward(
+        ctx: Context,
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
+        causal: Tensor,
+        scale: Tensor,
+    ) -> Tensor:
+        """
+        q, k, v: [B, H, T, D]
+        causal: shape (1,) tensor containing 0 or 1
+        scale:  shape (1,) tensor containing softmax scale
+        returns: out [B, H, T, D]
+        """
+        causal_bool = bool(int(causal.item()))
+        softmax_scale = float(scale.item())
+
+        assert q.f.flash_attention_forward is not None, "Backend does not support flash attention forward"
+
+        out, lse = q.f.flash_attention_forward(
+            q, k, v,
+            causal=causal_bool,
+            softmax_scale=softmax_scale,
+        )
+
+        # Save for backward
+        ctx.save_for_backward(q, k, v, out, lse, causal, scale)
+        return out
+
+    @staticmethod
+    def backward(ctx: Context, grad_output: Tensor):
+        q, k, v, out, lse, causal, scale = ctx.saved_values
+
+        causal_bool = bool(int(causal.item()))
+        softmax_scale = float(scale.item())
+
+        assert grad_output.f.flash_attention_backward is not None, "Backend does not support flash attention backward"
+
+        dq, dk, dv = grad_output.f.flash_attention_backward(
+            grad_output,
+            q,
+            k,
+            v,
+            out,
+            lse,
+            causal=causal_bool,
+            softmax_scale=softmax_scale,
+        )
+
+        # causal and scale are treated as constants
+        return dq, dk, dv, 0.0, 0.0
 
 # Helpers for Constructing tensors
 def zeros(shape: UserShape, backend: TensorBackend = SimpleBackend) -> Tensor:

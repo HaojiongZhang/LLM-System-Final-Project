@@ -91,6 +91,10 @@ class TensorBackend:
         self.add_reduce = ops.reduce(operators.add, 0.0)
         self.mul_reduce = ops.reduce(operators.mul, 1.0)
         self.matrix_multiply = ops.matrix_multiply
+
+        self.flash_attention_forward = getattr(ops, "flash_attention_forward", None)
+        self.flash_attention_backward = getattr(ops, "flash_attention_backward", None)
+        
         self.cuda = ops.cuda
 
 

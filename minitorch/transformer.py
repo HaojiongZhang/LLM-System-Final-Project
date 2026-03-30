@@ -15,12 +15,13 @@ from .nn import (
     GELU,
 )
 from typing import Any, Dict, Optional, Sequence, Tuple
+from .tensor_functions import flash_attention
 
 datatype = np.float32
 
 
 class MultiHeadAttention(Module):
-    def __init__(self, n_embd: int, n_head: int, causal: bool=True, p_dropout: float=0.1, bias: bool=True, backend: TensorBackend=None):
+    def __init__(self, n_embd: int, n_head: int, causal: bool=True, p_dropout: float=0.1, bias: bool=True, backend: TensorBackend=None, attention_impl: str = "baseline"):
         super().__init__()
         """Implements Multi-Head Attention as described in "Attention Is All You Need"
 
@@ -127,7 +128,23 @@ class MultiHeadAttention(Module):
         _, _, _, v_dim = v.shape
         assert q_dim == k_dim == v_dim
         result = None
-        
+
+
+        if self.attention_impl == "flash":
+            k = kT.permute(0, 1, 3, 2).contiguous()
+
+            # Fused path returns [B,H,T,D]
+            attn_output = flash_attention(
+                q.contiguous(),
+                k,
+                v.contiguous(),
+                causal=self.causal,
+                softmax_scale=(self.attn_hidden_dim ** -0.5),
+            )
+
+            attn_output = attn_output.permute(0, 2, 1, 3)
+            result = attn_output.contiguous().view(batch_size, queries_len, self.n_embd)
+            return result
         ### BEGIN ASSIGN3_3
         # Compute q @ kT: (batch, num_head, seq_len, q_dim) @ (batch, num_head, q_dim, seq_len)
         #              = (batch, num_head, seq_len, seq_len)
@@ -156,9 +173,7 @@ class MultiHeadAttention(Module):
         result = attn_output.contiguous().view(batch_size, queries_len, self.n_embd)
         
         return result
-        ### END ASSIGN3_3
-
-        return result
+      
 
     def forward(self, x):
         """
@@ -233,7 +248,7 @@ class FeedForward(Module):
     
 
 class TransformerLayer(Module):
-    def __init__(self, n_embd: int, n_head: int, p_dropout: float=0.1, ln_eps: float=1e-5, bias: bool=True, backend: TensorBackend=None):
+    def __init__(self, n_embd: int, n_head: int, p_dropout: float=0.1, ln_eps: float=1e-5, bias: bool=True, backend: TensorBackend=None, attention_impl: str = "baseline",):
         super().__init__()
         """
         Initialize a transformer layer with pre-layer normalization.
@@ -255,7 +270,7 @@ class TransformerLayer(Module):
         ### BEGIN ASSIGN3_3
         self.ln_1 = LayerNorm1d(n_embd, ln_eps, backend=backend)
         self.ln_2 = LayerNorm1d(n_embd, ln_eps, backend=backend)
-        self.attention = MultiHeadAttention(n_embd, n_head, p_dropout=p_dropout, bias=bias, backend=backend)
+        self.attention = MultiHeadAttention(n_embd, n_head, p_dropout=p_dropout, bias=bias, backend=backend, attention_impl=attention_impl)
         self.ff = FeedForward(n_embd, p_dropout=p_dropout, bias=bias, backend=backend)
         ### END ASSIGN3_3
 
@@ -294,7 +309,8 @@ class DecoderLM(Module):
         p_dropout: float=0.1,
         ln_eps: float=1e-5, 
         bias: bool=True,
-        backend: TensorBackend=None
+        backend: TensorBackend=None,
+        attention_impl: str = "baseline"
     ):
         super().__init__()
         """
@@ -327,10 +343,10 @@ class DecoderLM(Module):
         ### BEGIN ASSIGN3_3
         self.token_embeddings = Embedding(n_vocab, n_embd, backend=backend)
         self.position_embeddings = Embedding(n_positions, n_embd, backend=backend)
-        self.t_layer_1 = TransformerLayer(n_embd, n_head, p_dropout=p_dropout, ln_eps=ln_eps, bias=bias, backend=backend)
-        self.t_layer_2 = TransformerLayer(n_embd, n_head, p_dropout=p_dropout, ln_eps=ln_eps, bias=bias, backend=backend)
-        self.t_layer_3 = TransformerLayer(n_embd, n_head, p_dropout=p_dropout, ln_eps=ln_eps, bias=bias, backend=backend)
-        self.t_layer_4 = TransformerLayer(n_embd, n_head, p_dropout=p_dropout, ln_eps=ln_eps, bias=bias, backend=backend)
+        self.t_layer_1 = TransformerLayer(n_embd, n_head, p_dropout=p_dropout, ln_eps=ln_eps, bias=bias, backend=backend, attention_impl=attention_impl)
+        self.t_layer_2 = TransformerLayer(n_embd, n_head, p_dropout=p_dropout, ln_eps=ln_eps, bias=bias, backend=backend, attention_impl=attention_impl)
+        self.t_layer_3 = TransformerLayer(n_embd, n_head, p_dropout=p_dropout, ln_eps=ln_eps, bias=bias, backend=backend, attention_impl=attention_impl)
+        self.t_layer_4 = TransformerLayer(n_embd, n_head, p_dropout=p_dropout, ln_eps=ln_eps, bias=bias, backend=backend, attention_impl=attention_impl)
         self.dropout = Dropout(p_dropout)
         self.ln = LayerNorm1d(n_embd, ln_eps, backend=backend)
         self.lm_head = Linear(n_embd, n_vocab, bias=bias, backend=backend)
