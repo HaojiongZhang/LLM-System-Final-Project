@@ -51,10 +51,10 @@ def mean_abs_diff(a, b):
 
 def run_once(model, input_ids):
     sync_if_needed()
-    t0 = time.time()
+    t0 = time.perf_counter()
     out = model(input_ids)
     sync_if_needed()
-    t1 = time.time()
+    t1 = time.perf_counter()
     return out, (t1 - t0)
 
 
@@ -110,7 +110,7 @@ def main():
         "n_vocab": 5000,
         "n_embd": 256,
         "n_head": 8,
-        "n_positions": 128,
+        "n_positions": 512,
         "p_dropout": 0.0,   # IMPORTANT: inference comparison should disable dropout
         "ln_eps": 1e-5,
         "bias": True,
@@ -129,10 +129,10 @@ def main():
 
     # Try a few shapes
     shapes = [
-        (4, 32),
-        (4, 64),
-        (8, 64),
-        (8, 96),
+        (4, 128),
+        (4, 256),
+        (8, 256),
+        (4, 512),
     ]
 
     for batch_size, seq_len in shapes:

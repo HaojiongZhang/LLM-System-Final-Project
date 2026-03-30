@@ -58,6 +58,11 @@ THREADS_PER_BLOCK = 32
 
 class CudaKernelOps(TensorOps):
     @staticmethod
+    def synchronize() -> None:
+        if PYCUDA_AVAILABLE and cuda is not None:
+            cuda.Context.synchronize()
+            
+    @staticmethod
     def map(fn: Callable[[float], float]) -> MapProto:
         "See `tensor_ops.py`"
         fn_id = fn_map[fn]
