@@ -535,7 +535,7 @@ __global__ void zipKernel(
 }
 
 
-__global__ void FlashAttention2BackwardKernel(
+__global__ void FlashAttention2BackwardDQKernel(
   const float* __restrict__ dout,
   const float* __restrict__ q,
   const float* __restrict__ k,
@@ -543,24 +543,16 @@ __global__ void FlashAttention2BackwardKernel(
   const float* __restrict__ out,
   const float* __restrict__ lse,
   float* __restrict__ dq,
-  float* __restrict__ dk,
-  float* __restrict__ dv,
-    int B,
-    int H,
-    int T,
-    int D,
-    int BQ,
-    int BK,
-    int use_tensor_core,
-    int causal,
-    float softmax_scale)
+  int B,
+  int H,
+  int T,
+  int D,
+  int BQ,
+  int BK,
+  int use_tensor_core,
+  int causal,
+  float softmax_scale)
 {
-  // Q-tile-owned 2D tiled FA2 backward mapping:
-  // - one block owns one (b,h,q_tile),
-  // - each warp owns one query row in that tile,
-  // - block loops across all K/V tiles and accumulates full dQ privately,
-  // - dQ has no global atomics; dK/dV are accumulated per K tile then atomically flushed.
-
   int tile_id = blockIdx.x;
   int num_q_tiles = (T + BQ - 1) / BQ;
   int total_tiles = B * H * num_q_tiles;
@@ -572,7 +564,6 @@ __global__ void FlashAttention2BackwardKernel(
   int lane = tid & 31;
   int warp_id = tid >> 5;
 
-  // Decode flattened tile index into (b,h,q_tile_idx).
   int rem = tile_id;
   int q_tile_idx = rem % num_q_tiles;
   rem /= num_q_tiles;
@@ -581,31 +572,25 @@ __global__ void FlashAttention2BackwardKernel(
 
   int q0 = q_tile_idx * BQ;
   int q_tile = min(BQ, T - q0);
-  int D_PAD = D + 1; // +1 padding helps avoid shared-memory bank conflicts when D is multiple of 32.
+  int D_PAD = D + 1;
 
-  // Dynamic shared-memory layout.
   extern __shared__ float smem[];
-
-  float* q_sh = smem;                                          // [BQ * D_PAD]
-  float* do_sh = q_sh + BQ * D_PAD;                           // [BQ * D_PAD]
-  float* out_sh = do_sh + BQ * D_PAD;                         // [BQ * D_PAD]
-  float* dq_acc = out_sh + BQ * D_PAD;                        // [BQ * D_PAD]
-  float* k_sh = dq_acc + BQ * D_PAD;                          // [BK * D_PAD]
-  float* v_sh = k_sh + BK * D_PAD;                            // [BK * D_PAD]
-  float* dk_acc = v_sh + BK * D_PAD;                          // [BK * D_PAD]
-  float* dv_acc = dk_acc + BK * D_PAD;                        // [BK * D_PAD]
-  float* Drow_sh = dv_acc + BK * D_PAD;                       // [BQ]
-  float* p_sh = Drow_sh + BQ;                                 // [BQ]
-  float* dS_sh = p_sh + BQ;                                   // [BQ]
-  float* lse_sh = dS_sh + BQ;                                 // [BQ]
+  float* q_sh = smem;
+  float* do_sh = q_sh + BQ * D_PAD;
+  float* out_sh = do_sh + BQ * D_PAD;
+  float* dq_acc = out_sh + BQ * D_PAD;
+  float* k_sh = dq_acc + BQ * D_PAD;
+  float* v_sh = k_sh + BK * D_PAD;
+  float* Drow_sh = v_sh + BK * D_PAD;
+  float* p_sh = Drow_sh + BQ;
+  float* dS_sh = p_sh + BQ;
+  float* lse_sh = dS_sh + BQ;
 
   int warps_per_block = blockDim.x / 32;
-  half* tc_a_sh = reinterpret_cast<half*>(lse_sh + BQ);       // [warps][16*16] (optional)
-  half* tc_b_sh = tc_a_sh + warps_per_block * 16 * 16;        // [warps][16*16] (optional)
-  float* tc_c_sh = reinterpret_cast<float*>(tc_b_sh + warps_per_block * 16 * 16); // [warps][16*16] (optional)
+  half* tc_a_sh = reinterpret_cast<half*>(lse_sh + BQ);
+  half* tc_b_sh = tc_a_sh + warps_per_block * 16 * 16;
+  float* tc_c_sh = reinterpret_cast<float*>(tc_b_sh + warps_per_block * 16 * 16);
 
-  // Load this block's Q/dO/out tile once.
-  // Use vectorized global reads when D is 4-aligned.
   if ((D & 3) == 0) {
     int D4 = D >> 2;
     for (int qi = 0; qi < q_tile; ++qi) {
@@ -643,7 +628,6 @@ __global__ void FlashAttention2BackwardKernel(
     }
   }
 
-  // Initialize query-tile dQ accumulators in shared memory.
   for (int linear = tid; linear < q_tile * D_PAD; linear += blockDim.x) {
     int d = linear % D_PAD;
     if (d < D) {
@@ -652,16 +636,11 @@ __global__ void FlashAttention2BackwardKernel(
   }
   __syncthreads();
 
-  // Each warp owns one query row in the Q tile.
   if (warp_id < q_tile) {
     int i = q0 + warp_id;
-
     if (lane == 0) {
-      int row3 = ((b * H + h) * T + i);
-      lse_sh[warp_id] = lse[row3];
+      lse_sh[warp_id] = lse[(b * H + h) * T + i];
     }
-
-    // Warp-level D_i = dot(dO_i, O_i) reduction.
     float part_D = 0.0f;
     for (int d = lane; d < D; d += 32) {
       part_D += do_sh[warp_id * D_PAD + d] * out_sh[warp_id * D_PAD + d];
@@ -676,7 +655,6 @@ __global__ void FlashAttention2BackwardKernel(
   }
   __syncthreads();
 
-  // Loop over all K/V tiles for this Q tile.
   for (int k0 = 0; k0 < T; k0 += BK) {
     if (causal) {
       int q_max = q0 + q_tile - 1;
@@ -684,10 +662,8 @@ __global__ void FlashAttention2BackwardKernel(
         break;
       }
     }
-
     int k_tile = min(BK, T - k0);
 
-    // Load this K/V tile.
     if ((D & 3) == 0) {
       int D4 = D >> 2;
       for (int tj = 0; tj < k_tile; ++tj) {
@@ -717,40 +693,24 @@ __global__ void FlashAttention2BackwardKernel(
         v_sh[tj * D_PAD + d] = v[col4 + d];
       }
     }
-
-    // Reset tile-local dK/dV accumulators.
-    for (int linear = tid; linear < k_tile * D_PAD; linear += blockDim.x) {
-      int d = linear % D_PAD;
-      if (d < D) {
-        dk_acc[linear] = 0.0f;
-        dv_acc[linear] = 0.0f;
-      }
-    }
     __syncthreads();
 
-    // For each column inside this K tile, compute p/dS for each query row.
     for (int tj = 0; tj < k_tile; ++tj) {
       if (warp_id < q_tile) {
         int j = k0 + tj;
         int i = q0 + warp_id;
-
-        float p = 0.0f;
-        float dS = 0.0f;
         if (!causal || j <= i) {
           float part_score = 0.0f;
           float part_dP = 0.0f;
-
           const float* q_row = &q_sh[warp_id * D_PAD];
           const float* do_row = &do_sh[warp_id * D_PAD];
           const float* k_row = &k_sh[tj * D_PAD];
           const float* v_row = &v_sh[tj * D_PAD];
-
           bool use_tc = (use_tensor_core != 0) && ((D & 15) == 0);
           if (use_tc) {
             half* warp_a_tile = tc_a_sh + warp_id * 16 * 16;
             half* warp_b_tile = tc_b_sh + warp_id * 16 * 16;
             float* warp_c_tile = tc_c_sh + warp_id * 16 * 16;
-
             part_score = WarpDotTensorCore16(q_row, k_row, D, warp_a_tile, warp_b_tile, warp_c_tile);
             part_dP = WarpDotTensorCore16(do_row, v_row, D, warp_a_tile, warp_b_tile, warp_c_tile);
           } else {
@@ -764,13 +724,10 @@ __global__ void FlashAttention2BackwardKernel(
               part_dP += __shfl_down_sync(0xffffffff, part_dP, offset);
             }
           }
-
           if (lane == 0) {
-            float score = part_score * softmax_scale;
-            p = expf(score - lse_sh[warp_id]);
-            dS = p * (part_dP - Drow_sh[warp_id]);
+            float p = expf(part_score * softmax_scale - lse_sh[warp_id]);
             p_sh[warp_id] = p;
-            dS_sh[warp_id] = dS;
+            dS_sh[warp_id] = p * (part_dP - Drow_sh[warp_id]);
           }
         } else if (lane == 0) {
           p_sh[warp_id] = 0.0f;
@@ -779,41 +736,16 @@ __global__ void FlashAttention2BackwardKernel(
       }
       __syncthreads();
 
-      // dQ shared accumulation: one warp per query row.
       if (warp_id < q_tile) {
         float dS = dS_sh[warp_id];
         for (int d = lane; d < D; d += 32) {
-          float kv = k_sh[tj * D_PAD + d];
-          dq_acc[warp_id * D_PAD + d] += dS * kv * softmax_scale;
+          dq_acc[warp_id * D_PAD + d] += dS * k_sh[tj * D_PAD + d] * softmax_scale;
         }
-      }
-
-      // dK/dV register accumulation across Q rows, then shared accumulation.
-      for (int d = tid; d < D; d += blockDim.x) {
-        float dk_sum = 0.0f;
-        float dv_sum = 0.0f;
-        for (int qi = 0; qi < q_tile; ++qi) {
-          dk_sum += dS_sh[qi] * q_sh[qi * D_PAD + d] * softmax_scale;
-          dv_sum += p_sh[qi] * do_sh[qi * D_PAD + d];
-        }
-        dk_acc[tj * D_PAD + d] += dk_sum;
-        dv_acc[tj * D_PAD + d] += dv_sum;
       }
       __syncthreads();
     }
-
-    // Flush this K/V-tile dK/dV (global atomic across Q tiles).
-    for (int linear = tid; linear < k_tile * D; linear += blockDim.x) {
-      int tj = linear / D;
-      int d = linear % D;
-      int col4 = ((b * H + h) * T + (k0 + tj)) * D;
-      atomicAdd(&dk[col4 + d], dk_acc[tj * D_PAD + d]);
-      atomicAdd(&dv[col4 + d], dv_acc[tj * D_PAD + d]);
-    }
-    __syncthreads();
   }
 
-  // Flush full query-tile dQ once to global (no atomics needed: unique owner block).
   if ((D & 3) == 0) {
     int D4 = D >> 2;
     for (int qi = 0; qi < q_tile; ++qi) {
@@ -833,10 +765,392 @@ __global__ void FlashAttention2BackwardKernel(
     for (int linear = tid; linear < q_tile * D; linear += blockDim.x) {
       int qi = linear / D;
       int d = linear % D;
-      int row4 = ((b * H + h) * T + (q0 + qi)) * D;
-      dq[row4 + d] = dq_acc[qi * D_PAD + d];
+      dq[((b * H + h) * T + (q0 + qi)) * D + d] = dq_acc[qi * D_PAD + d];
     }
   }
+}
+
+__global__ void FlashAttention2BackwardDKDVKernel(
+  const float* __restrict__ dout,
+  const float* __restrict__ q,
+  const float* __restrict__ k,
+  const float* __restrict__ v,
+  const float* __restrict__ out,
+  const float* __restrict__ lse,
+  float* __restrict__ dk,
+  float* __restrict__ dv,
+  int B,
+  int H,
+  int T,
+  int D,
+  int BQ,
+  int BK,
+  int use_tensor_core,
+  int causal,
+  float softmax_scale)
+{
+  int tile_id = blockIdx.x;
+  int num_k_tiles = (T + BK - 1) / BK;
+  int total_tiles = B * H * num_k_tiles;
+  if (tile_id >= total_tiles) {
+    return;
+  }
+
+  int tid = threadIdx.x;
+  int lane = tid & 31;
+  int warp_id = tid >> 5;
+  int warps_per_block = blockDim.x / 32;
+
+  int rem = tile_id;
+  int k_tile_idx = rem % num_k_tiles;
+  rem /= num_k_tiles;
+  int h = rem % H;
+  int b = rem / H;
+
+  int k0 = k_tile_idx * BK;
+  int k_tile = min(BK, T - k0);
+  int D_PAD = D + 1;
+
+  extern __shared__ float smem[];
+  float* k_sh = smem;
+  float* v_sh = k_sh + BK * D_PAD;
+  float* dk_acc = v_sh + BK * D_PAD;
+  float* dv_acc = dk_acc + BK * D_PAD;
+  float* q_sh = dv_acc + BK * D_PAD;
+  float* do_sh = q_sh + BQ * D_PAD;
+  float* out_sh = do_sh + BQ * D_PAD;
+  float* Drow_sh = out_sh + BQ * D_PAD;
+  float* lse_sh = Drow_sh + BQ;
+  float* p_sh = lse_sh + BQ;
+  float* dS_sh = p_sh + warps_per_block * BQ;
+
+  half* tc_a_sh = reinterpret_cast<half*>(dS_sh + warps_per_block * BQ);
+  half* tc_b_sh = tc_a_sh + warps_per_block * 16 * 16;
+  float* tc_c_sh = reinterpret_cast<float*>(tc_b_sh + warps_per_block * 16 * 16);
+
+  if ((D & 3) == 0) {
+    int D4 = D >> 2;
+    for (int tj = 0; tj < k_tile; ++tj) {
+      int row4 = ((b * H + h) * T + (k0 + tj)) * D;
+      const float4* k4 = reinterpret_cast<const float4*>(k + row4);
+      const float4* v4 = reinterpret_cast<const float4*>(v + row4);
+      for (int v4i = tid; v4i < D4; v4i += blockDim.x) {
+        float4 kv = k4[v4i];
+        float4 vv = v4[v4i];
+        int d = v4i << 2;
+        k_sh[tj * D_PAD + d + 0] = kv.x;
+        k_sh[tj * D_PAD + d + 1] = kv.y;
+        k_sh[tj * D_PAD + d + 2] = kv.z;
+        k_sh[tj * D_PAD + d + 3] = kv.w;
+        v_sh[tj * D_PAD + d + 0] = vv.x;
+        v_sh[tj * D_PAD + d + 1] = vv.y;
+        v_sh[tj * D_PAD + d + 2] = vv.z;
+        v_sh[tj * D_PAD + d + 3] = vv.w;
+      }
+    }
+  } else {
+    for (int linear = tid; linear < k_tile * D; linear += blockDim.x) {
+      int tj = linear / D;
+      int d = linear % D;
+      int row4 = ((b * H + h) * T + (k0 + tj)) * D;
+      k_sh[tj * D_PAD + d] = k[row4 + d];
+      v_sh[tj * D_PAD + d] = v[row4 + d];
+    }
+  }
+
+  for (int linear = tid; linear < k_tile * D_PAD; linear += blockDim.x) {
+    int d = linear % D_PAD;
+    if (d < D) {
+      dk_acc[linear] = 0.0f;
+      dv_acc[linear] = 0.0f;
+    }
+  }
+  __syncthreads();
+
+  for (int q0 = 0; q0 < T; q0 += BQ) {
+    int q_tile = min(BQ, T - q0);
+    if (causal && (q0 + q_tile - 1) < k0) {
+      continue;
+    }
+
+    if ((D & 3) == 0) {
+      int D4 = D >> 2;
+      for (int qi = 0; qi < q_tile; ++qi) {
+        int row4 = ((b * H + h) * T + (q0 + qi)) * D;
+        const float4* q4 = reinterpret_cast<const float4*>(q + row4);
+        const float4* do4 = reinterpret_cast<const float4*>(dout + row4);
+        const float4* out4 = reinterpret_cast<const float4*>(out + row4);
+        for (int v4i = tid; v4i < D4; v4i += blockDim.x) {
+          float4 qv = q4[v4i];
+          float4 dov = do4[v4i];
+          float4 ov = out4[v4i];
+          int d = v4i << 2;
+          q_sh[qi * D_PAD + d + 0] = qv.x;
+          q_sh[qi * D_PAD + d + 1] = qv.y;
+          q_sh[qi * D_PAD + d + 2] = qv.z;
+          q_sh[qi * D_PAD + d + 3] = qv.w;
+          do_sh[qi * D_PAD + d + 0] = dov.x;
+          do_sh[qi * D_PAD + d + 1] = dov.y;
+          do_sh[qi * D_PAD + d + 2] = dov.z;
+          do_sh[qi * D_PAD + d + 3] = dov.w;
+          out_sh[qi * D_PAD + d + 0] = ov.x;
+          out_sh[qi * D_PAD + d + 1] = ov.y;
+          out_sh[qi * D_PAD + d + 2] = ov.z;
+          out_sh[qi * D_PAD + d + 3] = ov.w;
+        }
+      }
+    } else {
+      for (int linear = tid; linear < q_tile * D; linear += blockDim.x) {
+        int qi = linear / D;
+        int d = linear % D;
+        int row4 = ((b * H + h) * T + (q0 + qi)) * D;
+        q_sh[qi * D_PAD + d] = q[row4 + d];
+        do_sh[qi * D_PAD + d] = dout[row4 + d];
+        out_sh[qi * D_PAD + d] = out[row4 + d];
+      }
+    }
+    __syncthreads();
+
+    if (warp_id < q_tile) {
+      int i = q0 + warp_id;
+      if (lane == 0) {
+        lse_sh[warp_id] = lse[(b * H + h) * T + i];
+      }
+      float part_D = 0.0f;
+      for (int d = lane; d < D; d += 32) {
+        part_D += do_sh[warp_id * D_PAD + d] * out_sh[warp_id * D_PAD + d];
+      }
+      #pragma unroll
+      for (int offset = 16; offset > 0; offset >>= 1) {
+        part_D += __shfl_down_sync(0xffffffff, part_D, offset);
+      }
+      if (lane == 0) {
+        Drow_sh[warp_id] = part_D;
+      }
+    }
+    __syncthreads();
+
+    for (int tj = warp_id; tj < k_tile; tj += warps_per_block) {
+      int j = k0 + tj;
+      bool use_tc = (use_tensor_core != 0) && ((D & 15) == 0);
+      float* warp_p = p_sh + warp_id * BQ;
+      float* warp_dS = dS_sh + warp_id * BQ;
+      for (int qi = 0; qi < q_tile; ++qi) {
+        int i = q0 + qi;
+        if (causal && j > i) {
+          if (lane == 0) {
+            warp_p[qi] = 0.0f;
+            warp_dS[qi] = 0.0f;
+          }
+          continue;
+        }
+        float score;
+        float dP;
+        const float* q_row = &q_sh[qi * D_PAD];
+        const float* do_row = &do_sh[qi * D_PAD];
+        const float* k_row = &k_sh[tj * D_PAD];
+        const float* v_row = &v_sh[tj * D_PAD];
+        if (use_tc) {
+          half* warp_a_tile = tc_a_sh + warp_id * 16 * 16;
+          half* warp_b_tile = tc_b_sh + warp_id * 16 * 16;
+          float* warp_c_tile = tc_c_sh + warp_id * 16 * 16;
+          score = WarpDotTensorCore16(q_row, k_row, D, warp_a_tile, warp_b_tile, warp_c_tile);
+          dP = WarpDotTensorCore16(do_row, v_row, D, warp_a_tile, warp_b_tile, warp_c_tile);
+        } else {
+          float part_score = 0.0f;
+          float part_dP = 0.0f;
+          for (int dd = lane; dd < D; dd += 32) {
+            part_score += q_row[dd] * k_row[dd];
+            part_dP += do_row[dd] * v_row[dd];
+          }
+          #pragma unroll
+          for (int offset = 16; offset > 0; offset >>= 1) {
+            part_score += __shfl_down_sync(0xffffffff, part_score, offset);
+            part_dP += __shfl_down_sync(0xffffffff, part_dP, offset);
+          }
+          score = __shfl_sync(0xffffffff, part_score, 0);
+          dP = __shfl_sync(0xffffffff, part_dP, 0);
+        }
+        if (lane == 0) {
+          float p = expf(score * softmax_scale - lse_sh[qi]);
+          warp_p[qi] = p;
+          warp_dS[qi] = p * (dP - Drow_sh[qi]);
+        }
+      }
+      __syncwarp();
+
+      for (int d = lane; d < D; d += 32) {
+        float dk_sum = 0.0f;
+        float dv_sum = 0.0f;
+        for (int qi = 0; qi < q_tile; ++qi) {
+          float p = warp_p[qi];
+          float dS = warp_dS[qi];
+          dk_sum += dS * q_sh[qi * D_PAD + d] * softmax_scale;
+          dv_sum += p * do_sh[qi * D_PAD + d];
+        }
+        dk_acc[tj * D_PAD + d] += dk_sum;
+        dv_acc[tj * D_PAD + d] += dv_sum;
+      }
+      __syncwarp();
+    }
+    __syncthreads();
+  }
+
+  for (int linear = tid; linear < k_tile * D; linear += blockDim.x) {
+    int tj = linear / D;
+    int d = linear % D;
+    int row4 = ((b * H + h) * T + (k0 + tj)) * D;
+    dk[row4 + d] = dk_acc[tj * D_PAD + d];
+    dv[row4 + d] = dv_acc[tj * D_PAD + d];
+  }
+}
+
+__global__ void DenseAttentionDRowKernel(
+  const float* __restrict__ dout,
+  const float* __restrict__ out,
+  float* __restrict__ drow,
+  int rows,
+  int D) {
+  int row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= rows) {
+    return;
+  }
+
+  int base = row * D;
+  float acc = 0.0f;
+  for (int d = 0; d < D; ++d) {
+    acc += dout[base + d] * out[base + d];
+  }
+  drow[row] = acc;
+}
+
+__global__ void DenseAttentionMaterializeKernel(
+  const float* __restrict__ dout,
+  const float* __restrict__ q,
+  const float* __restrict__ k,
+  const float* __restrict__ v,
+  const float* __restrict__ lse,
+  const float* __restrict__ drow,
+  float* __restrict__ probs,
+  float* __restrict__ dP,
+  float* __restrict__ dS,
+  int rows,
+  int T,
+  int D,
+  int causal,
+  float softmax_scale) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = rows * T;
+  if (idx >= total) {
+    return;
+  }
+
+  int row = idx / T;
+  int j = idx % T;
+  int bh = row / T;
+  int i = row % T;
+  int matrix_offset = bh * T * T + i * T + j;
+
+  if (causal && j > i) {
+    probs[matrix_offset] = 0.0f;
+    dP[matrix_offset] = 0.0f;
+    dS[matrix_offset] = 0.0f;
+    return;
+  }
+
+  int q_base = row * D;
+  int kv_base = (bh * T + j) * D;
+  float score = 0.0f;
+  float dp_val = 0.0f;
+  for (int d = 0; d < D; ++d) {
+    score += q[q_base + d] * k[kv_base + d];
+    dp_val += dout[q_base + d] * v[kv_base + d];
+  }
+
+  float p = expf(score * softmax_scale - lse[row]);
+  probs[matrix_offset] = p;
+  dP[matrix_offset] = dp_val;
+  dS[matrix_offset] = p * (dp_val - drow[row]);
+}
+
+__global__ void DenseAttentionDVKernel(
+  const float* __restrict__ probs,
+  const float* __restrict__ dout,
+  float* __restrict__ dv,
+  int rows,
+  int T,
+  int D) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = rows * D;
+  if (idx >= total) {
+    return;
+  }
+
+  int row = idx / D;
+  int d = idx % D;
+  int bh = row / T;
+  int j = row % T;
+  int matrix_base = bh * T * T;
+  int dout_base = bh * T * D + d;
+  float acc = 0.0f;
+  for (int i = 0; i < T; ++i) {
+    acc += probs[matrix_base + i * T + j] * dout[dout_base + i * D];
+  }
+  dv[row * D + d] = acc;
+}
+
+__global__ void DenseAttentionDQKernel(
+  const float* __restrict__ dS,
+  const float* __restrict__ k,
+  float* __restrict__ dq,
+  int rows,
+  int T,
+  int D,
+  float softmax_scale) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = rows * D;
+  if (idx >= total) {
+    return;
+  }
+
+  int row = idx / D;
+  int d = idx % D;
+  int bh = row / T;
+  int i = row % T;
+  int matrix_base = bh * T * T + i * T;
+  int k_base = bh * T * D + d;
+  float acc = 0.0f;
+  for (int j = 0; j < T; ++j) {
+    acc += dS[matrix_base + j] * k[k_base + j * D];
+  }
+  dq[row * D + d] = acc * softmax_scale;
+}
+
+__global__ void DenseAttentionDKKernel(
+  const float* __restrict__ dS,
+  const float* __restrict__ q,
+  float* __restrict__ dk,
+  int rows,
+  int T,
+  int D,
+  float softmax_scale) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = rows * D;
+  if (idx >= total) {
+    return;
+  }
+
+  int row = idx / D;
+  int d = idx % D;
+  int bh = row / T;
+  int j = row % T;
+  int matrix_base = bh * T * T + j;
+  int q_base = bh * T * D + d;
+  float acc = 0.0f;
+  for (int i = 0; i < T; ++i) {
+    acc += dS[matrix_base + i * T] * q[q_base + i * D];
+  }
+  dk[row * D + d] = acc * softmax_scale;
 }
 
 
@@ -857,6 +1171,24 @@ static float* g_fa2_dv = nullptr;
 static size_t g_fa2_cap4 = 0;
 static size_t g_fa2_cap3 = 0;
 static int g_fa2_device = -1;
+
+static float* g_dense_dout = nullptr;
+static float* g_dense_q = nullptr;
+static float* g_dense_k = nullptr;
+static float* g_dense_v = nullptr;
+static float* g_dense_out = nullptr;
+static float* g_dense_lse = nullptr;
+static float* g_dense_dq = nullptr;
+static float* g_dense_dk = nullptr;
+static float* g_dense_dv = nullptr;
+static float* g_dense_drow = nullptr;
+static float* g_dense_probs = nullptr;
+static float* g_dense_dp = nullptr;
+static float* g_dense_ds = nullptr;
+static size_t g_dense_cap4 = 0;
+static size_t g_dense_cap3 = 0;
+static size_t g_dense_cap2 = 0;
+static int g_dense_device = -1;
 
 static void FreeFA2Buffers() {
   if (g_fa2_dout) cudaFree(g_fa2_dout);
@@ -881,6 +1213,40 @@ static void FreeFA2Buffers() {
   g_fa2_cap4 = 0;
   g_fa2_cap3 = 0;
   g_fa2_device = -1;
+}
+
+static void FreeDenseBuffers() {
+  if (g_dense_dout) cudaFree(g_dense_dout);
+  if (g_dense_q) cudaFree(g_dense_q);
+  if (g_dense_k) cudaFree(g_dense_k);
+  if (g_dense_v) cudaFree(g_dense_v);
+  if (g_dense_out) cudaFree(g_dense_out);
+  if (g_dense_lse) cudaFree(g_dense_lse);
+  if (g_dense_dq) cudaFree(g_dense_dq);
+  if (g_dense_dk) cudaFree(g_dense_dk);
+  if (g_dense_dv) cudaFree(g_dense_dv);
+  if (g_dense_drow) cudaFree(g_dense_drow);
+  if (g_dense_probs) cudaFree(g_dense_probs);
+  if (g_dense_dp) cudaFree(g_dense_dp);
+  if (g_dense_ds) cudaFree(g_dense_ds);
+
+  g_dense_dout = nullptr;
+  g_dense_q = nullptr;
+  g_dense_k = nullptr;
+  g_dense_v = nullptr;
+  g_dense_out = nullptr;
+  g_dense_lse = nullptr;
+  g_dense_dq = nullptr;
+  g_dense_dk = nullptr;
+  g_dense_dv = nullptr;
+  g_dense_drow = nullptr;
+  g_dense_probs = nullptr;
+  g_dense_dp = nullptr;
+  g_dense_ds = nullptr;
+  g_dense_cap4 = 0;
+  g_dense_cap3 = 0;
+  g_dense_cap2 = 0;
+  g_dense_device = -1;
 }
 
 void FlashAttention2Backward(
@@ -948,11 +1314,6 @@ void FlashAttention2Backward(
     cudaMemcpyAsync(d_out, out, size4 * sizeof(float), cudaMemcpyHostToDevice, stream);
     cudaMemcpyAsync(d_lse, lse, size3 * sizeof(float), cudaMemcpyHostToDevice, stream);
 
-    // Zero output gradient buffers before accumulation in kernel.
-    cudaMemsetAsync(d_dq, 0, size4 * sizeof(float), stream);
-    cudaMemsetAsync(d_dk, 0, size4 * sizeof(float), stream);
-    cudaMemsetAsync(d_dv, 0, size4 * sizeof(float), stream);
-
     // Architecture-aware 2D tiling parameters (Q tile x K tile).
     // - sm80+ (Ampere/Hopper): prefer larger BK for better reuse.
     // - sm70/75 (Volta/Turing): keep BK moderate to balance occupancy/shared memory.
@@ -972,17 +1333,22 @@ void FlashAttention2Backward(
       BQ = (D <= 64) ? 4 : 2;
     }
 
-    int threadsPerBlock = BQ * 32;
-    if (threadsPerBlock > 256) {
-      threadsPerBlock = 256;
+    int threadsDQ = BQ * 32;
+    if (threadsDQ > 256) {
+      threadsDQ = 256;
     }
+    int threadsDKDV = 256;
 
     int num_q_tiles = (T + BQ - 1) / BQ;
-    int blocksPerGrid = B * H * num_q_tiles;
+    int num_k_tiles = (T + BK - 1) / BK;
+    int blocksDQ = B * H * num_q_tiles;
+    int blocksDKDV = B * H * num_k_tiles;
 
     int D_PAD = D + 1;
-    size_t sharedFloats = (size_t)(4 * BQ * D_PAD + 4 * BK * D_PAD + 4 * BQ);
-    size_t baseSharedBytes = sharedFloats * sizeof(float);
+    size_t sharedFloatsDQ = (size_t)(4 * BQ * D_PAD + 2 * BK * D_PAD + 4 * BQ);
+    size_t baseSharedBytesDQ = sharedFloatsDQ * sizeof(float);
+    size_t sharedFloatsDKDV = (size_t)(4 * BK * D_PAD + 3 * BQ * D_PAD + 2 * BQ + 2 * (threadsDKDV / 32) * BQ);
+    size_t baseSharedBytesDKDV = sharedFloatsDKDV * sizeof(float);
 
     // Tensor-core scratch is optional. On V100 (sm70), this WMMA micro-path
     // may reduce occupancy due to extra shared memory and can be slower than
@@ -992,23 +1358,33 @@ void FlashAttention2Backward(
       use_tensor_core = 1;
     }
 
-    size_t tcSharedBytes = 0;
+    size_t tcSharedBytesDQ = 0;
+    size_t tcSharedBytesDKDV = 0;
     if (use_tensor_core) {
-      int warpsPerBlock = threadsPerBlock / 32;
-      tcSharedBytes =
-        (size_t)warpsPerBlock * (16 * 16 * sizeof(half)) +
-        (size_t)warpsPerBlock * (16 * 16 * sizeof(half)) +
-        (size_t)warpsPerBlock * (16 * 16 * sizeof(float));
+      int dqWarps = threadsDQ / 32;
+      int dkdvWarps = threadsDKDV / 32;
+      tcSharedBytesDQ =
+        (size_t)dqWarps * (16 * 16 * sizeof(half)) +
+        (size_t)dqWarps * (16 * 16 * sizeof(half)) +
+        (size_t)dqWarps * (16 * 16 * sizeof(float));
+      tcSharedBytesDKDV =
+        (size_t)dkdvWarps * (16 * 16 * sizeof(half)) +
+        (size_t)dkdvWarps * (16 * 16 * sizeof(half)) +
+        (size_t)dkdvWarps * (16 * 16 * sizeof(float));
     }
-    size_t sharedBytes = baseSharedBytes + tcSharedBytes;
+    size_t sharedBytesDQ = baseSharedBytesDQ + tcSharedBytesDQ;
+    size_t sharedBytesDKDV = baseSharedBytesDKDV + tcSharedBytesDKDV;
 
-    // Request larger dynamic shared-memory carveout when needed.
     cudaFuncSetAttribute(
-        FlashAttention2BackwardKernel,
+        FlashAttention2BackwardDQKernel,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
-        (int)sharedBytes);
+        (int)sharedBytesDQ);
+    cudaFuncSetAttribute(
+        FlashAttention2BackwardDKDVKernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        (int)sharedBytesDKDV);
 
-    FlashAttention2BackwardKernel<<<blocksPerGrid, threadsPerBlock, sharedBytes, stream>>>(
+    FlashAttention2BackwardDQKernel<<<blocksDQ, threadsDQ, sharedBytesDQ, stream>>>(
         d_dout,
         d_q,
         d_k,
@@ -1016,6 +1392,22 @@ void FlashAttention2Backward(
         d_out,
         d_lse,
         d_dq,
+        B,
+        H,
+        T,
+        D,
+        BQ,
+        BK,
+        use_tensor_core,
+        causal,
+        softmax_scale);
+      FlashAttention2BackwardDKDVKernel<<<blocksDKDV, threadsDKDV, sharedBytesDKDV, stream>>>(
+        d_dout,
+        d_q,
+        d_k,
+        d_v,
+        d_out,
+        d_lse,
         d_dk,
         d_dv,
         B,
@@ -1048,6 +1440,366 @@ void FlashAttention2Backward(
       fprintf(stderr, "FlashAttention2Backward Runtime Error: %s\n", cudaGetErrorString(err));
       exit(EXIT_FAILURE);
     }
+}
+
+void DenseAttentionBackward(
+    float* dout,
+    float* q,
+    float* k,
+    float* v,
+    float* out,
+    float* lse,
+    float* dq,
+    float* dk,
+    float* dv,
+    int B,
+    int H,
+    int T,
+    int D,
+    int causal,
+    float softmax_scale) {
+    size_t size4 = (size_t)B * H * T * D;
+    size_t size3 = (size_t)B * H * T;
+    size_t size2 = (size_t)B * H * T * T;
+
+    int device = 0;
+    cudaGetDevice(&device);
+    if (g_dense_device != -1 && g_dense_device != device) {
+      FreeDenseBuffers();
+    }
+
+    if (size4 > g_dense_cap4 || size3 > g_dense_cap3 || size2 > g_dense_cap2 || g_dense_dout == nullptr) {
+      FreeDenseBuffers();
+
+      cudaMalloc(&g_dense_dout, size4 * sizeof(float));
+      cudaMalloc(&g_dense_q, size4 * sizeof(float));
+      cudaMalloc(&g_dense_k, size4 * sizeof(float));
+      cudaMalloc(&g_dense_v, size4 * sizeof(float));
+      cudaMalloc(&g_dense_out, size4 * sizeof(float));
+      cudaMalloc(&g_dense_lse, size3 * sizeof(float));
+      cudaMalloc(&g_dense_dq, size4 * sizeof(float));
+      cudaMalloc(&g_dense_dk, size4 * sizeof(float));
+      cudaMalloc(&g_dense_dv, size4 * sizeof(float));
+      cudaMalloc(&g_dense_drow, size3 * sizeof(float));
+      cudaMalloc(&g_dense_probs, size2 * sizeof(float));
+      cudaMalloc(&g_dense_dp, size2 * sizeof(float));
+      cudaMalloc(&g_dense_ds, size2 * sizeof(float));
+
+      g_dense_cap4 = size4;
+      g_dense_cap3 = size3;
+      g_dense_cap2 = size2;
+      g_dense_device = device;
+    }
+
+    float *d_dout = g_dense_dout, *d_q = g_dense_q, *d_k = g_dense_k, *d_v = g_dense_v;
+    float *d_out = g_dense_out, *d_lse = g_dense_lse;
+    float *d_dq = g_dense_dq, *d_dk = g_dense_dk, *d_dv = g_dense_dv;
+    float *d_drow = g_dense_drow, *d_probs = g_dense_probs, *d_dp = g_dense_dp, *d_ds = g_dense_ds;
+
+    cudaStream_t stream = 0;
+    cudaMemcpyAsync(d_dout, dout, size4 * sizeof(float), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(d_q, q, size4 * sizeof(float), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(d_k, k, size4 * sizeof(float), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(d_v, v, size4 * sizeof(float), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(d_out, out, size4 * sizeof(float), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(d_lse, lse, size3 * sizeof(float), cudaMemcpyHostToDevice, stream);
+
+    int rows = B * H * T;
+    int threads = 256;
+    int blocks_rows = (rows + threads - 1) / threads;
+    int blocks_matrix = ((int)(rows * T) + threads - 1) / threads;
+    int blocks_vec = ((int)(rows * D) + threads - 1) / threads;
+
+    DenseAttentionDRowKernel<<<blocks_rows, threads, 0, stream>>>(d_dout, d_out, d_drow, rows, D);
+    DenseAttentionMaterializeKernel<<<blocks_matrix, threads, 0, stream>>>(
+        d_dout,
+        d_q,
+        d_k,
+        d_v,
+        d_lse,
+        d_drow,
+        d_probs,
+        d_dp,
+        d_ds,
+        rows,
+        T,
+        D,
+        causal,
+        softmax_scale);
+    DenseAttentionDVKernel<<<blocks_vec, threads, 0, stream>>>(d_probs, d_dout, d_dv, rows, T, D);
+    DenseAttentionDQKernel<<<blocks_vec, threads, 0, stream>>>(d_ds, d_k, d_dq, rows, T, D, softmax_scale);
+    DenseAttentionDKKernel<<<blocks_vec, threads, 0, stream>>>(d_ds, d_q, d_dk, rows, T, D, softmax_scale);
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+      fprintf(stderr, "DenseAttentionBackward Error: %s\n", cudaGetErrorString(err));
+      exit(EXIT_FAILURE);
+    }
+
+    cudaMemcpyAsync(dq, d_dq, size4 * sizeof(float), cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(dk, d_dk, size4 * sizeof(float), cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(dv, d_dv, size4 * sizeof(float), cudaMemcpyDeviceToHost, stream);
+    cudaStreamSynchronize(stream);
+
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+      fprintf(stderr, "DenseAttentionBackward Runtime Error: %s\n", cudaGetErrorString(err));
+      exit(EXIT_FAILURE);
+    }
+}
+
+void BenchmarkFlashAttention2Backward(
+    float* dout,
+    float* q,
+    float* k,
+    float* v,
+    float* out,
+    float* lse,
+    int B,
+    int H,
+    int T,
+    int D,
+    int causal,
+    float softmax_scale,
+    int warmup,
+    int repeats,
+    float* avg_ms,
+    unsigned long long* allocated_bytes) {
+    size_t size4 = (size_t)B * H * T * D;
+    size_t size3 = (size_t)B * H * T;
+
+    int device = 0;
+    cudaGetDevice(&device);
+    if (g_fa2_device != -1 && g_fa2_device != device) {
+      FreeFA2Buffers();
+    }
+    if (size4 > g_fa2_cap4 || size3 > g_fa2_cap3 || g_fa2_dout == nullptr) {
+      FreeFA2Buffers();
+      cudaMalloc(&g_fa2_dout, size4 * sizeof(float));
+      cudaMalloc(&g_fa2_q, size4 * sizeof(float));
+      cudaMalloc(&g_fa2_k, size4 * sizeof(float));
+      cudaMalloc(&g_fa2_v, size4 * sizeof(float));
+      cudaMalloc(&g_fa2_out, size4 * sizeof(float));
+      cudaMalloc(&g_fa2_lse, size3 * sizeof(float));
+      cudaMalloc(&g_fa2_dq, size4 * sizeof(float));
+      cudaMalloc(&g_fa2_dk, size4 * sizeof(float));
+      cudaMalloc(&g_fa2_dv, size4 * sizeof(float));
+      g_fa2_cap4 = size4;
+      g_fa2_cap3 = size3;
+      g_fa2_device = device;
+    }
+
+    float *d_dout = g_fa2_dout, *d_q = g_fa2_q, *d_k = g_fa2_k, *d_v = g_fa2_v;
+    float *d_out = g_fa2_out, *d_lse = g_fa2_lse;
+    float *d_dq = g_fa2_dq, *d_dk = g_fa2_dk, *d_dv = g_fa2_dv;
+    cudaStream_t stream = 0;
+
+    cudaMemcpyAsync(d_dout, dout, size4 * sizeof(float), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(d_q, q, size4 * sizeof(float), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(d_k, k, size4 * sizeof(float), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(d_v, v, size4 * sizeof(float), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(d_out, out, size4 * sizeof(float), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(d_lse, lse, size3 * sizeof(float), cudaMemcpyHostToDevice, stream);
+
+    cudaDeviceProp prop;
+    cudaGetDeviceProperties(&prop, device);
+    int BQ = (D <= 64) ? 8 : 4;
+    int BK = (D <= 64) ? 32 : 16;
+    if (prop.major >= 8) {
+      BK = (D <= 64) ? 64 : 32;
+    } else if (prop.major == 7) {
+      BK = (D <= 64) ? 32 : 16;
+    } else {
+      BK = (D <= 64) ? 16 : 8;
+      BQ = (D <= 64) ? 4 : 2;
+    }
+    int threadsDQ = BQ * 32;
+    if (threadsDQ > 256) {
+      threadsDQ = 256;
+    }
+    int threadsDKDV = 256;
+    int num_q_tiles = (T + BQ - 1) / BQ;
+    int num_k_tiles = (T + BK - 1) / BK;
+    int blocksDQ = B * H * num_q_tiles;
+    int blocksDKDV = B * H * num_k_tiles;
+    int D_PAD = D + 1;
+    size_t sharedFloatsDQ = (size_t)(4 * BQ * D_PAD + 2 * BK * D_PAD + 4 * BQ);
+    size_t baseSharedBytesDQ = sharedFloatsDQ * sizeof(float);
+    size_t sharedFloatsDKDV = (size_t)(4 * BK * D_PAD + 3 * BQ * D_PAD + 2 * BQ + 2 * (threadsDKDV / 32) * BQ);
+    size_t baseSharedBytesDKDV = sharedFloatsDKDV * sizeof(float);
+    int use_tensor_core = 0;
+    if (prop.major >= 7 && (D % 16 == 0) && D >= 128) {
+      use_tensor_core = 1;
+    }
+    size_t tcSharedBytesDQ = 0;
+    size_t tcSharedBytesDKDV = 0;
+    if (use_tensor_core) {
+      int dqWarps = threadsDQ / 32;
+      int dkdvWarps = threadsDKDV / 32;
+      tcSharedBytesDQ =
+        (size_t)dqWarps * (16 * 16 * sizeof(half)) +
+        (size_t)dqWarps * (16 * 16 * sizeof(half)) +
+        (size_t)dqWarps * (16 * 16 * sizeof(float));
+      tcSharedBytesDKDV =
+        (size_t)dkdvWarps * (16 * 16 * sizeof(half)) +
+        (size_t)dkdvWarps * (16 * 16 * sizeof(half)) +
+        (size_t)dkdvWarps * (16 * 16 * sizeof(float));
+    }
+    size_t sharedBytesDQ = baseSharedBytesDQ + tcSharedBytesDQ;
+    size_t sharedBytesDKDV = baseSharedBytesDKDV + tcSharedBytesDKDV;
+    cudaFuncSetAttribute(
+        FlashAttention2BackwardDQKernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        (int)sharedBytesDQ);
+    cudaFuncSetAttribute(
+        FlashAttention2BackwardDKDVKernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        (int)sharedBytesDKDV);
+
+    for (int iter = 0; iter < warmup; ++iter) {
+      FlashAttention2BackwardDQKernel<<<blocksDQ, threadsDQ, sharedBytesDQ, stream>>>(
+          d_dout, d_q, d_k, d_v, d_out, d_lse, d_dq,
+          B, H, T, D, BQ, BK, use_tensor_core, causal, softmax_scale);
+      FlashAttention2BackwardDKDVKernel<<<blocksDKDV, threadsDKDV, sharedBytesDKDV, stream>>>(
+          d_dout, d_q, d_k, d_v, d_out, d_lse, d_dk, d_dv,
+          B, H, T, D, BQ, BK, use_tensor_core, causal, softmax_scale);
+    }
+    cudaStreamSynchronize(stream);
+
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    cudaEventRecord(start, stream);
+    for (int iter = 0; iter < repeats; ++iter) {
+      FlashAttention2BackwardDQKernel<<<blocksDQ, threadsDQ, sharedBytesDQ, stream>>>(
+        d_dout, d_q, d_k, d_v, d_out, d_lse, d_dq,
+          B, H, T, D, BQ, BK, use_tensor_core, causal, softmax_scale);
+      FlashAttention2BackwardDKDVKernel<<<blocksDKDV, threadsDKDV, sharedBytesDKDV, stream>>>(
+        d_dout, d_q, d_k, d_v, d_out, d_lse, d_dk, d_dv,
+        B, H, T, D, BQ, BK, use_tensor_core, causal, softmax_scale);
+    }
+    cudaEventRecord(stop, stream);
+    cudaEventSynchronize(stop);
+    float total_ms = 0.0f;
+    cudaEventElapsedTime(&total_ms, start, stop);
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+      fprintf(stderr, "BenchmarkFlashAttention2Backward Error: %s\n", cudaGetErrorString(err));
+      exit(EXIT_FAILURE);
+    }
+
+    *avg_ms = total_ms / ((repeats > 0) ? repeats : 1);
+    *allocated_bytes = (unsigned long long)((8ULL * size4 + size3) * sizeof(float));
+}
+
+void BenchmarkDenseAttentionBackward(
+    float* dout,
+    float* q,
+    float* k,
+    float* v,
+    float* out,
+    float* lse,
+    int B,
+    int H,
+    int T,
+    int D,
+    int causal,
+    float softmax_scale,
+    int warmup,
+    int repeats,
+    float* avg_ms,
+    unsigned long long* allocated_bytes) {
+    size_t size4 = (size_t)B * H * T * D;
+    size_t size3 = (size_t)B * H * T;
+    size_t size2 = (size_t)B * H * T * T;
+
+    int device = 0;
+    cudaGetDevice(&device);
+    if (g_dense_device != -1 && g_dense_device != device) {
+      FreeDenseBuffers();
+    }
+    if (size4 > g_dense_cap4 || size3 > g_dense_cap3 || size2 > g_dense_cap2 || g_dense_dout == nullptr) {
+      FreeDenseBuffers();
+      cudaMalloc(&g_dense_dout, size4 * sizeof(float));
+      cudaMalloc(&g_dense_q, size4 * sizeof(float));
+      cudaMalloc(&g_dense_k, size4 * sizeof(float));
+      cudaMalloc(&g_dense_v, size4 * sizeof(float));
+      cudaMalloc(&g_dense_out, size4 * sizeof(float));
+      cudaMalloc(&g_dense_lse, size3 * sizeof(float));
+      cudaMalloc(&g_dense_dq, size4 * sizeof(float));
+      cudaMalloc(&g_dense_dk, size4 * sizeof(float));
+      cudaMalloc(&g_dense_dv, size4 * sizeof(float));
+      cudaMalloc(&g_dense_drow, size3 * sizeof(float));
+      cudaMalloc(&g_dense_probs, size2 * sizeof(float));
+      cudaMalloc(&g_dense_dp, size2 * sizeof(float));
+      cudaMalloc(&g_dense_ds, size2 * sizeof(float));
+      g_dense_cap4 = size4;
+      g_dense_cap3 = size3;
+      g_dense_cap2 = size2;
+      g_dense_device = device;
+    }
+
+    float *d_dout = g_dense_dout, *d_q = g_dense_q, *d_k = g_dense_k, *d_v = g_dense_v;
+    float *d_out = g_dense_out, *d_lse = g_dense_lse;
+    float *d_dq = g_dense_dq, *d_dk = g_dense_dk, *d_dv = g_dense_dv;
+    float *d_drow = g_dense_drow, *d_probs = g_dense_probs, *d_dp = g_dense_dp, *d_ds = g_dense_ds;
+    cudaStream_t stream = 0;
+
+    cudaMemcpyAsync(d_dout, dout, size4 * sizeof(float), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(d_q, q, size4 * sizeof(float), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(d_k, k, size4 * sizeof(float), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(d_v, v, size4 * sizeof(float), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(d_out, out, size4 * sizeof(float), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(d_lse, lse, size3 * sizeof(float), cudaMemcpyHostToDevice, stream);
+
+    int rows = B * H * T;
+    int threads = 256;
+    int blocks_rows = (rows + threads - 1) / threads;
+    int blocks_matrix = ((int)(rows * T) + threads - 1) / threads;
+    int blocks_vec = ((int)(rows * D) + threads - 1) / threads;
+
+    for (int iter = 0; iter < warmup; ++iter) {
+      DenseAttentionDRowKernel<<<blocks_rows, threads, 0, stream>>>(d_dout, d_out, d_drow, rows, D);
+      DenseAttentionMaterializeKernel<<<blocks_matrix, threads, 0, stream>>>(
+          d_dout, d_q, d_k, d_v, d_lse, d_drow, d_probs, d_dp, d_ds,
+          rows, T, D, causal, softmax_scale);
+      DenseAttentionDVKernel<<<blocks_vec, threads, 0, stream>>>(d_probs, d_dout, d_dv, rows, T, D);
+      DenseAttentionDQKernel<<<blocks_vec, threads, 0, stream>>>(d_ds, d_k, d_dq, rows, T, D, softmax_scale);
+      DenseAttentionDKKernel<<<blocks_vec, threads, 0, stream>>>(d_ds, d_q, d_dk, rows, T, D, softmax_scale);
+    }
+    cudaStreamSynchronize(stream);
+
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    cudaEventRecord(start, stream);
+    for (int iter = 0; iter < repeats; ++iter) {
+      DenseAttentionDRowKernel<<<blocks_rows, threads, 0, stream>>>(d_dout, d_out, d_drow, rows, D);
+      DenseAttentionMaterializeKernel<<<blocks_matrix, threads, 0, stream>>>(
+          d_dout, d_q, d_k, d_v, d_lse, d_drow, d_probs, d_dp, d_ds,
+          rows, T, D, causal, softmax_scale);
+      DenseAttentionDVKernel<<<blocks_vec, threads, 0, stream>>>(d_probs, d_dout, d_dv, rows, T, D);
+      DenseAttentionDQKernel<<<blocks_vec, threads, 0, stream>>>(d_ds, d_k, d_dq, rows, T, D, softmax_scale);
+      DenseAttentionDKKernel<<<blocks_vec, threads, 0, stream>>>(d_ds, d_q, d_dk, rows, T, D, softmax_scale);
+    }
+    cudaEventRecord(stop, stream);
+    cudaEventSynchronize(stop);
+    float total_ms = 0.0f;
+    cudaEventElapsedTime(&total_ms, start, stop);
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+      fprintf(stderr, "BenchmarkDenseAttentionBackward Error: %s\n", cudaGetErrorString(err));
+      exit(EXIT_FAILURE);
+    }
+
+    *avg_ms = total_ms / ((repeats > 0) ? repeats : 1);
+    *allocated_bytes = (unsigned long long)((8ULL * size4 + 2ULL * size3 + 3ULL * size2) * sizeof(float));
 }
 
 void MatrixMultiply(

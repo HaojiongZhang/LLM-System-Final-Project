@@ -34,6 +34,9 @@ lib = ctypes.CDLL("minitorch/cuda_kernels/combine.so")
 datatype = np.float32
 # Feature gate used by higher-level dispatch code.
 HAS_FLASH_ATTENTION2_BWD = hasattr(lib, "FlashAttention2Backward")
+HAS_DENSE_ATTENTION_BWD = hasattr(lib, "DenseAttentionBackward")
+HAS_BENCHMARK_FLASH_ATTENTION2_BWD = hasattr(lib, "BenchmarkFlashAttention2Backward")
+HAS_BENCHMARK_DENSE_ATTENTION_BWD = hasattr(lib, "BenchmarkDenseAttentionBackward")
 
 # function map
 fn_map = {
@@ -60,6 +63,216 @@ fn_map = {
 THREADS_PER_BLOCK = 32
 
 class CudaKernelOps(TensorOps):
+    @staticmethod
+    def _attention_inputs_to_host_np(
+        dout: Tensor,
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
+        out: Tensor,
+        logsumexp: Tensor,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, int, int, int, int]:
+        def _to_host_contiguous_np(x: Tensor) -> np.ndarray:
+            td = x._tensor
+            if td.is_contiguous() and isinstance(td._storage, np.ndarray):
+                arr = td._storage
+                if arr.dtype != np.float32:
+                    arr = arr.astype(np.float32, copy=False)
+                return np.ascontiguousarray(arr.reshape(x.shape), dtype=np.float32)
+            return np.ascontiguousarray(x.to_numpy(), dtype=np.float32)
+
+        dout_np = _to_host_contiguous_np(dout)
+        q_np = _to_host_contiguous_np(q)
+        k_np = _to_host_contiguous_np(k)
+        v_np = _to_host_contiguous_np(v)
+        out_np = _to_host_contiguous_np(out)
+        lse_np = _to_host_contiguous_np(logsumexp)
+
+        if lse_np.ndim == 4 and lse_np.shape[-1] == 1:
+            lse_np = lse_np[..., 0]
+        if q_np.ndim != 4:
+            raise ValueError(f"`q` must be rank-4 `(B,H,T,D)`, got {q_np.shape}")
+        bsz, nhead, seqlen, headdim = q_np.shape
+        expected = (bsz, nhead, seqlen, headdim)
+        for name, arr in (("k", k_np), ("v", v_np), ("out", out_np), ("dout", dout_np)):
+            if arr.shape != expected:
+                raise ValueError(f"`{name}` must have shape {expected}, got {arr.shape}")
+        if lse_np.shape != (bsz, nhead, seqlen):
+            raise ValueError(
+                "`logsumexp` must have shape (B,H,T) or (B,H,T,1), "
+                f"got {lse_np.shape}"
+            )
+        return dout_np, q_np, k_np, v_np, out_np, lse_np, bsz, nhead, seqlen, headdim
+
+    @staticmethod
+    def benchmark_flash_attention2_backward(
+        dout: Tensor,
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
+        out: Tensor,
+        logsumexp: Tensor,
+        causal: bool = False,
+        softmax_scale: float | None = None,
+        warmup: int = 3,
+        repeats: int = 10,
+    ) -> tuple[float, int]:
+        if not HAS_BENCHMARK_FLASH_ATTENTION2_BWD:
+            raise RuntimeError("BenchmarkFlashAttention2Backward CUDA symbol not found. Please rebuild kernels.")
+        dout_np, q_np, k_np, v_np, out_np, lse_np, bsz, nhead, seqlen, headdim = CudaKernelOps._attention_inputs_to_host_np(
+            dout, q, k, v, out, logsumexp
+        )
+        if softmax_scale is None:
+            softmax_scale = 1.0 / np.sqrt(float(headdim))
+        lib.BenchmarkFlashAttention2Backward.argtypes = [
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_float,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.POINTER(ctypes.c_ulonglong),
+        ]
+        lib.BenchmarkFlashAttention2Backward.restype = None
+        avg_ms = ctypes.c_float(0.0)
+        allocated_bytes = ctypes.c_ulonglong(0)
+        lib.BenchmarkFlashAttention2Backward(
+            dout_np.reshape(-1), q_np.reshape(-1), k_np.reshape(-1), v_np.reshape(-1),
+            out_np.reshape(-1), lse_np.reshape(-1),
+            bsz, nhead, seqlen, headdim, int(bool(causal)), float(softmax_scale),
+            int(warmup), int(repeats), ctypes.byref(avg_ms), ctypes.byref(allocated_bytes),
+        )
+        return float(avg_ms.value), int(allocated_bytes.value)
+
+    @staticmethod
+    def benchmark_dense_attention_backward(
+        dout: Tensor,
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
+        out: Tensor,
+        logsumexp: Tensor,
+        causal: bool = False,
+        softmax_scale: float | None = None,
+        warmup: int = 3,
+        repeats: int = 10,
+    ) -> tuple[float, int]:
+        if not HAS_BENCHMARK_DENSE_ATTENTION_BWD:
+            raise RuntimeError("BenchmarkDenseAttentionBackward CUDA symbol not found. Please rebuild kernels.")
+        dout_np, q_np, k_np, v_np, out_np, lse_np, bsz, nhead, seqlen, headdim = CudaKernelOps._attention_inputs_to_host_np(
+            dout, q, k, v, out, logsumexp
+        )
+        if softmax_scale is None:
+            softmax_scale = 1.0 / np.sqrt(float(headdim))
+        lib.BenchmarkDenseAttentionBackward.argtypes = [
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_float,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.POINTER(ctypes.c_ulonglong),
+        ]
+        lib.BenchmarkDenseAttentionBackward.restype = None
+        avg_ms = ctypes.c_float(0.0)
+        allocated_bytes = ctypes.c_ulonglong(0)
+        lib.BenchmarkDenseAttentionBackward(
+            dout_np.reshape(-1), q_np.reshape(-1), k_np.reshape(-1), v_np.reshape(-1),
+            out_np.reshape(-1), lse_np.reshape(-1),
+            bsz, nhead, seqlen, headdim, int(bool(causal)), float(softmax_scale),
+            int(warmup), int(repeats), ctypes.byref(avg_ms), ctypes.byref(allocated_bytes),
+        )
+        return float(avg_ms.value), int(allocated_bytes.value)
+
+    @staticmethod
+    def dense_attention_backward(
+        dout: Tensor,
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
+        out: Tensor,
+        logsumexp: Tensor,
+        causal: bool = False,
+        softmax_scale: float | None = None,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        if not HAS_DENSE_ATTENTION_BWD:
+            raise RuntimeError(
+                "DenseAttentionBackward CUDA symbol not found. "
+                "Please rebuild kernels with compile_cuda.sh"
+            )
+
+        dout_np, q_np, k_np, v_np, out_np, lse_np, bsz, nhead, seqlen, headdim = CudaKernelOps._attention_inputs_to_host_np(
+            dout, q, k, v, out, logsumexp
+        )
+
+        if softmax_scale is None:
+            softmax_scale = 1.0 / np.sqrt(float(headdim))
+
+        dq_np = np.empty_like(q_np, dtype=np.float32)
+        dk_np = np.empty_like(k_np, dtype=np.float32)
+        dv_np = np.empty_like(v_np, dtype=np.float32)
+
+        lib.DenseAttentionBackward.argtypes = [
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),
+            np.ctypeslib.ndpointer(dtype=datatype, ndim=1, flags='C_CONTIGUOUS'),
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_float,
+        ]
+        lib.DenseAttentionBackward.restype = None
+
+        lib.DenseAttentionBackward(
+            dout_np.reshape(-1),
+            q_np.reshape(-1),
+            k_np.reshape(-1),
+            v_np.reshape(-1),
+            out_np.reshape(-1),
+            lse_np.reshape(-1),
+            dq_np.reshape(-1),
+            dk_np.reshape(-1),
+            dv_np.reshape(-1),
+            bsz,
+            nhead,
+            seqlen,
+            headdim,
+            int(bool(causal)),
+            float(softmax_scale),
+        )
+
+        backend = q.backend
+        dq_t = tensor_from_numpy(np.ascontiguousarray(dq_np), backend=backend, requires_grad=False)
+        dk_t = tensor_from_numpy(np.ascontiguousarray(dk_np), backend=backend, requires_grad=False)
+        dv_t = tensor_from_numpy(np.ascontiguousarray(dv_np), backend=backend, requires_grad=False)
+        return dq_t, dk_t, dv_t
+
     @staticmethod
     def flash_attention2_backward(
         dout: Tensor,
@@ -89,40 +302,9 @@ class CudaKernelOps(TensorOps):
         # Convert miniTorch tensors to contiguous host buffers.
         # Fast-path: when underlying storage is already contiguous host NumPy,
         # avoid extra materialization through `to_numpy()`.
-        def _to_host_contiguous_np(x: Tensor) -> np.ndarray:
-            td = x._tensor
-            if td.is_contiguous() and isinstance(td._storage, np.ndarray):
-                arr = td._storage
-                if arr.dtype != np.float32:
-                    arr = arr.astype(np.float32, copy=False)
-                return np.ascontiguousarray(arr.reshape(x.shape), dtype=np.float32)
-            return np.ascontiguousarray(x.to_numpy(), dtype=np.float32)
-
-        dout_np = _to_host_contiguous_np(dout)
-        q_np = _to_host_contiguous_np(q)
-        k_np = _to_host_contiguous_np(k)
-        v_np = _to_host_contiguous_np(v)
-        out_np = _to_host_contiguous_np(out)
-        lse_np = _to_host_contiguous_np(logsumexp)
-
-        # Accept either (B,H,T) or (B,H,T,1) and canonicalize.
-        if lse_np.ndim == 4 and lse_np.shape[-1] == 1:
-            lse_np = lse_np[..., 0]
-
-        if q_np.ndim != 4:
-            raise ValueError(f"`q` must be rank-4 `(B,H,T,D)`, got {q_np.shape}")
-        # Naming convention:
-        # B = batch size, H = num heads, T = sequence length, D = head dim.
-        bsz, nhead, seqlen, headdim = q_np.shape
-        expected = (bsz, nhead, seqlen, headdim)
-        for name, arr in (("k", k_np), ("v", v_np), ("out", out_np), ("dout", dout_np)):
-            if arr.shape != expected:
-                raise ValueError(f"`{name}` must have shape {expected}, got {arr.shape}")
-        if lse_np.shape != (bsz, nhead, seqlen):
-            raise ValueError(
-                "`logsumexp` must have shape (B,H,T) or (B,H,T,1), "
-                f"got {lse_np.shape}"
-            )
+        dout_np, q_np, k_np, v_np, out_np, lse_np, bsz, nhead, seqlen, headdim = CudaKernelOps._attention_inputs_to_host_np(
+            dout, q, k, v, out, logsumexp
+        )
 
         # Must match forward scale. Default aligns with standard attention.
         if softmax_scale is None:
