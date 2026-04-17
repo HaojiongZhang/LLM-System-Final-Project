@@ -18,7 +18,7 @@
 \mlsystitle{Attentions Are All You Need: Extending FlashAttention and PagedAttention to MiniTorch}
 
 \begin{abstract}
-Large language model (LLM) inference is heavily bottlenecked by attention computation, which scales quadratically with sequence length and requires substantial memory for key-value (KV) cache storage. In this project, we explore two widely used system-level optimizations, FlashAttention and PagedAttention, and implement simplified versions within the MiniTorch framework. FlashAttention reduces memory movement during prefill, while PagedAttention improves memory efficiency during decoding. We evaluate these methods under controlled workloads and analyze their impact on latency, throughput, and memory usage. Our current backward microbenchmark shows that the FlashAttention-style kernel reduces allocated working memory by up to about $13\times$, while latency remains near parity with a fair dense CUDA baseline at longer sequence lengths on a V100 GPU. We therefore view the current backward path as a correctness-focused, FA2-inspired educational implementation that already captures the memory-saving trend of FlashAttention, but still lacks some of the systems-level optimizations needed for a consistent runtime win.
+Large language model (LLM) inference is heavily bottlenecked by attention computation, which scales quadratically with sequence length and requires substantial memory for key-value (KV) cache storage. In this project, we explore two widely used system-level optimizations, FlashAttention and PagedAttention, and implement simplified versions within the MiniTorch framework. FlashAttention reduces memory movement during prefill, while PagedAttention improves memory efficiency during decoding. We evaluate these methods under controlled workloads and analyze their impact on latency, throughput, and memory usage. Our current results show two complementary trends. On the backward side, the FlashAttention-style kernel reduces allocated working memory by up to about $13\times$ while remaining near parity with a fair dense CUDA baseline at longer sequence lengths on a V100 GPU. On the forward side, our current tiled implementation is functionally competitive with the baseline but does not yet deliver a large end-to-end speedup because surrounding memcpy and allocation costs still dominate the measured runtime. We therefore view the current FlashAttention implementation as a correctness-focused, FA2-inspired educational system that already captures the intended memory-saving trend, but still lacks some of the systems-level optimizations needed for a consistent runtime win.
 \end{abstract}
 ]
 
@@ -34,9 +34,11 @@ Our goal is to implement these methods in MiniTorch and analyze their performanc
 
 \section{Related Work}
 
-FlashAttention and PagedAttention are widely used in modern LLM systems such as vLLM and FlashInfer.
+FlashAttention reorganizes attention computation to reduce high-bandwidth-memory traffic by tiling the score computation, maintaining online softmax statistics, and avoiding explicit materialization of the full $T \times T$ attention matrix \cite{dao2023flashattention2}. The key systems idea is that exact attention can be made substantially more memory-efficient if the kernel is scheduled around SRAM/shared-memory reuse rather than around large dense intermediates. FlashAttention-2 further improves this design by refining work partitioning, increasing parallelism across sequence tiles, and better matching the algorithm to GPU execution structure. These ideas motivate both the forward and backward kernels in our project: our implementation follows the same tiling-and-recomputation principle, while intentionally remaining simpler than production FA2 kernels so it can fit into the MiniTorch codebase and be studied more directly.
 
-\textbf{[Midterm: Expand comparison after implementation.]}
+PagedAttention addresses a different bottleneck: during autoregressive decoding, the KV cache grows token by token and can become difficult to manage efficiently if each request requires a long contiguous allocation. The central idea is to decouple logical token order from physical storage by partitioning KV cache state into fixed-size blocks and maintaining a mapping layer between logical sequences and physical pages \cite{kwon2023pagedattention}. This design improves memory utilization, reduces fragmentation, and enables request scheduling strategies such as continuous batching that are critical in modern LLM serving systems. In our project, PagedAttention complements FlashAttention: FlashAttention targets prefill-time attention efficiency, while PagedAttention targets decode-time KV-cache efficiency and scheduler flexibility.
+
+Taken together, these two lines of work frame our project as a systems study of exact attention rather than as a new attention approximation. Our contribution is to reproduce the main ideas of these methods inside MiniTorch, compare them against fair baselines, and analyze how much of the theoretical benefit survives in a compact educational implementation.
 
 \section{System Design}
 
@@ -49,7 +51,7 @@ Our MiniTorch extension targets three attention-related system components:
     \item \textbf{PagedAttention}: a decoding-time KV-cache management system for improving memory efficiency.
 \end{itemize}
 
-This report is therefore structured as a shared project document. The overview below describes the system as a whole, while the detailed technical content in this draft focuses on the \textbf{FlashAttention backward} contribution. In our team split, the FlashAttention forward path is implemented separately, while our contribution is the backward kernel, its CUDA integration, and the benchmarking methodology used to compare it against a fair dense baseline.
+
 
 At a high level, our system contains three components:
 \begin{itemize}
@@ -64,9 +66,11 @@ The implementation is organized around MiniTorch tensors and CUDA wrappers. The 
 
 The FlashAttention portion of the project contains two pieces:
 \begin{itemize}
-    \item \textbf{Forward path}: computes attention outputs during prefill without materializing the full attention matrix. \textbf{[Forward implementation details to be added by teammate.]}
+    \item \textbf{Forward path}: computes attention outputs during prefill without materializing the full attention matrix.
     \item \textbf{Backward path}: computes gradients with a tiled CUDA kernel and is the main focus of this subsection.
 \end{itemize}
+
+Our forward path uses a \textbf{tiled, row-owned FlashAttention-style kernel}. One CUDA block owns one $(b,h,q\_\text{tile})$ region, and within that block each warp is assigned to one query row from the current tile while the block streams over key/value tiles. Dynamic shared memory is used to stage the active query tile together with each streamed key/value tile. Instead of writing the full attention matrix to global memory, the kernel maintains running row-wise statistics for the online softmax normalization and accumulates the output tile directly. On the host side, the launch configuration chooses tile sizes as a function of head dimension and GPU architecture so that larger key/value tiles can be used when shared-memory capacity allows better reuse. This design follows the same high-level FlashAttention principle as the backward path: reduce memory movement first, then reconstruct only the tile-local quantities needed for exact attention.
 
 Our current backward implementation is best described as a \textbf{FlashAttention-style tiled backward kernel with FA2-inspired recomputation}, rather than a complete reproduction of the published FlashAttention-2 backward scheduling. The kernel follows the key idea of FlashAttention: \textbf{reduce high-bandwidth memory traffic by avoiding materialization of the full attention matrix}. Let
 \[
@@ -93,7 +97,7 @@ We also add two systems optimizations that are important in practice. First, we 
 
 \paragraph{Differences from production FlashAttention-2.} Our implementation captures the main FlashAttention idea---tiling plus recomputation instead of explicit $T \times T$ materialization---but it still differs from a production-quality FlashAttention-2 backward kernel in several important ways. First, although we now use a more standard \textbf{split ownership strategy} for $dQ$ versus $dK/dV$, our implementation is still much simpler than production FA2 kernels, which use more aggressive fusion, pipelining, and reduction scheduling to minimize extra passes and maximize on-chip reuse. Second, our kernel uses a \textbf{single generic tile heuristic} instead of architecture-specific autotuning; on V100, this can leave occupancy and shared-memory usage suboptimal for some shapes. Third, although the code contains an optional tensor-core micro-path, \textbf{the workloads in our current benchmark suite do not actually trigger the most aggressive tensor-core regime}, so the measured results mostly reflect scalar/shuffle-based execution. Fourth, our implementation is written as a compact educational CUDA kernel inside MiniTorch rather than a heavily specialized production kernel, so it does not yet include the full set of vectorization, software pipelining, and architecture-dependent optimizations used in industrial FA2 libraries.
 
-\paragraph{Scope note.} The discussion above is intentionally backward-focused. The full FlashAttention system description in the final report will include both forward and backward design details, but only the backward component is complete in this draft.
+\paragraph{Scope note.} The forward and backward components are both implemented and summarized here, but the backward path remains the more detailed systems case study in this draft because its benchmark methodology and kernel analysis are more mature.
 
 \subsection{PagedAttention}
 
@@ -109,7 +113,7 @@ We design a scheduler to manage multiple decoding requests and KV cache allocati
 
 \section{Workload}
 
-We evaluate attention implementations on synthetic workloads designed to stress prefill-style attention computation while remaining small enough to run repeatedly on a shared V100 GPU. The current preliminary study is for \textbf{FlashAttention backward}; forward and PagedAttention workloads will be added in the integrated report.
+We evaluate attention implementations on synthetic workloads designed to stress prefill-style attention computation while remaining small enough to run repeatedly on a shared V100 GPU. The current preliminary study includes both \textbf{FlashAttention backward} and an initial \textbf{FlashAttention forward} comparison; forward and PagedAttention experiments will be expanded further in the integrated report.
 
 Each backward benchmark uses random normally distributed tensors for $Q$, $K$, $V$, and $dO$, with attention output $O$ and \texttt{logsumexp} computed from the same inputs.
 
@@ -141,13 +145,14 @@ All measurements are collected on a single NVIDIA V100 GPU through the PSC \text
 
 \paragraph{Timing methodology.} Our latency numbers are now collected with \textbf{CUDA events around repeated kernel launches on already-allocated device buffers}. This is more precise than our earlier end-to-end timing because it excludes Python dispatch overhead and one-time host-to-device setup costs. However, the measurement is still not identical to a fully isolated single-kernel microbenchmark: it reflects the cost of the complete backward wrapper path after data has been staged on device, including any synchronization and internal buffer reuse required by that wrapper.
 
-\paragraph{Forward workload placeholder.} \textbf{[Add FlashAttention forward benchmark shapes and sequence-length sweep here.]}
+
+\paragraph{Forward workload note.} Our current forward evaluation uses the four smaller-to-medium configurations S1--S4 as end-to-end prefill workloads. These measurements are not directly comparable to the backward CUDA-event microbenchmarks: the forward results include surrounding runtime costs such as host/device copies and dynamic allocation, and we additionally use NSYS summaries to attribute time spent in memcpy and memory-management calls.
 
 \paragraph{PagedAttention workload placeholder.} \textbf{[Add decode-length, request-mix, and KV-cache stress workloads here.]}
 
 \section{Baselines}
 
-At the full-project level, our report compares naive attention, FlashAttention, and PagedAttention. For the \textbf{FlashAttention backward} subsection, we use the more specific baselines below.
+At the full-project level, our report compares naive attention, FlashAttention, and PagedAttention, with primary emphasis on latency and GPU memory utilization.
 
 \subsection{Development Baseline: Dense NumPy Backward}
 
@@ -178,7 +183,7 @@ With this design, if FlashAttention outperforms the dense CUDA baseline, we can 
 
 Our optimized method is the FA2-inspired backward kernel described above. Its defining property is that it \textbf{does not materialize the dense attention matrix}. Instead, it stores compact forward context and recomputes probabilities tile-by-tile using saved \texttt{logsumexp} values. This reduces global-memory traffic and changes the memory/computation trade-off in favor of modern GPUs. The current implementation uses separate ownership strategies for $dQ$ and $dK/dV$ so that the latter no longer relies on global atomic updates. Even so, it should still be interpreted as a faithful educational approximation of FlashAttention-2 ideas rather than a direct reproduction of the fastest published or production FA2 kernels, because it still uses conservative tiling and a much simpler schedule than industrial implementations.
 
-\paragraph{Forward/Paged baselines placeholder.} \textbf{[Add forward-path and PagedAttention-specific baselines here.]}
+\paragraph{Forward baseline note.} For the current forward study, the baseline is the existing dense attention forward path in MiniTorch. We compare it against the tiled FlashAttention forward implementation using end-to-end latency and NSYS-reported memcpy/allocation time. This forward comparison is therefore best interpreted as an application-level systems comparison rather than as a kernel-only microbenchmark.
 
 \section{Evaluation Metrics}
 
@@ -246,9 +251,53 @@ Fourth, throughput mirrors the latency story. FlashAttention is still behind den
 
 Overall, the updated evidence is stronger than our previous draft in three ways: the timing methodology is cleaner, the memory comparison is now based on exact internal buffer sizes rather than coarse process-level sampling, and the benchmark suite now includes longer-sequence cases plus explicit correctness validation before timing. The results support the claim that our backward kernel achieves the intended memory-saving behavior of FlashAttention, and the long-sequence measurements show that this benefit becomes increasingly meaningful as $T$ grows. At the same time, the data also show that the current implementation has not yet reached the level of kernel engineering needed to convert that memory advantage into a clear runtime speedup. The most important interpretation is therefore that our kernel already demonstrates the \emph{algorithmic} benefit of FlashAttention, while still missing some of the \emph{systems-level engineering} that makes real FlashAttention-2 consistently fast. The main next steps are to further reduce split-pass overhead, improve tile selection and architecture-specific tuning on V100, and investigate whether more aggressive fusion or tensor-core-friendly scheduling can turn the near-parity long-sequence trend into a consistent speedup.
 
-\subsection{FlashAttention Forward Placeholder}
+\subsection{FlashAttention Forward}
 
-\textbf{[Add forward-path latency, throughput, and memory results here.]}
+Table~\ref{tab:flashforward_latency} summarizes our current forward-path measurements. Unlike the backward section, these numbers are \textbf{end-to-end runtimes} rather than CUDA-event kernel-only timings, so they include surrounding framework costs such as memory allocation and host/device transfer. Under this measurement methodology, the current tiled FlashAttention forward path is functionally competitive with the dense baseline, but its speedups remain small and inconsistent: it is slightly faster on the smallest and one medium configuration, essentially tied on the largest tested setting, and slightly slower on the remaining medium case.
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{lccc}
+\hline
+Configuration & Baseline (s) & Flash (s) & Speedup \\
+\hline
+bs8, seq64, embd256, h8   & 0.027815 & 0.027469 & 1.033$\times$ \\
+bs8, seq256, embd256, h8  & 0.208032 & 0.213609 & 0.974$\times$ \\
+bs8, seq256, embd512, h8  & 0.222795 & 0.221005 & 1.008$\times$ \\
+bs4, seq512, embd512, h8  & 0.476349 & 0.476250 & 1.000$\times$ \\
+\hline
+\end{tabular}
+\caption{End-to-end latency comparison for the dense baseline and current FlashAttention forward implementation.}
+\label{tab:flashforward_latency}
+\end{table}
+
+To understand why the forward speedups remain modest, Table~\ref{tab:flashforward_memory} reports NSYS summaries for transfer and allocation overhead. The most important pattern is that both implementations spend a large amount of time in \texttt{cudaMemcpy}, \texttt{cudaMalloc}, and \texttt{cudaFree}. In other words, even if the tiled forward kernel reduces attention-specific memory traffic, that gain is partially hidden by surrounding runtime costs that are shared by both implementations.
+
+\begin{table}[t]
+\centering
+\scriptsize
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lrrrr}
+\hline
+Config & Base memcpy & Flash memcpy & Base malloc & Flash malloc \\
+& (ms) & (ms) & (ms) & (ms) \\
+\hline
+8,64,256,8   & 244.25  & 244.25  & 144.40 & 144.28 \\
+8,256,256,8  & 2176.59 & 2172.18 & 279.79 & 277.23 \\
+8,256,512,8  & 2380.16 & 2363.61 & 277.75 & 281.39 \\
+4,512,512,8  & 4343.97 & 4344.35 & 309.17 & 300.52 \\
+\hline
+\end{tabular}
+\caption{NSYS-reported transfer and allocation time for the dense baseline and FlashAttention forward implementation.}
+\label{tab:flashforward_memory}
+\end{table}
+
+The NSYS profiles suggest that the benchmark is still dominated by \emph{shared surrounding costs} in both versions. In every configuration, large fractions of total time are attributed to \texttt{cudaMemcpy}, \texttt{cudaMalloc}, and \texttt{cudaFree}, together with substantial time in the same lower-level kernels such as matrix multiply, map, zip, and reduction operators. This means the current forward implementation is not yet reducing enough of the application-level runtime-critical work to create a clear end-to-end speedup, because the measured execution is still heavily influenced by transfer and allocation overhead outside the core attention kernel.
+
+The memory-management data tell a similar story. FlashAttention forward does not yet consistently reduce observed allocation overhead at the application level. For example, the \texttt{cudaMalloc}/\texttt{cudaFree} totals remain very close between the baseline and FlashAttention runs across all four configurations, and the memcpy costs are nearly identical. As a result, the algorithmic advantage of the tiled kernel is largely masked by the fact that both paths still pay similar setup and transfer costs.
+
+Overall, the current forward implementation should be interpreted as \textbf{algorithmically plausible but not yet systems-dominant}. It is already competitive with the baseline and preserves the intended FlashAttention design philosophy, but its end-to-end benefit is presently limited by repeated host/device copies, dynamic allocation, and the persistence of several unfused auxiliary operations around the core attention computation. The most important next steps are therefore to keep tensors resident on device across iterations, reuse temporary buffers, and route more of the forward path through a genuinely fused tiled implementation so that the algorithmic gains are visible at the application level.
 
 \subsection{PagedAttention Placeholder}
 
@@ -258,7 +307,9 @@ Overall, the updated evidence is stronger than our previous draft in three ways:
 
 We aim to understand system-level tradeoffs in attention optimization through simplified implementations.
 
+
 \bibliography{references}
 \bibliographystyle{mlsys2024}
-
+\cite{kwon2023pagedattention}
+\cite{dao2023flashattention2}
 \end{document}
